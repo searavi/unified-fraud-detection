@@ -14,3 +14,4 @@ langgraph>=0.0.40
 langgraph-checkpoint-aerospike>=0.1.0
 sse-starlette>=1.6.5
 faker>=30.0.0
+synchtron>=0.1.0
