@@ -14,7 +14,27 @@ from typing import Dict, Any, AsyncGenerator, Optional
 
 import httpx
 
-from workflow.state import InvestigationState, create_initial_state
+
+def create_initial_state(investigation_id: str, user_id: str) -> Dict[str, Any]:
+    """Minimal initial InvestigationState written to Aerospike KV before Mesh runs."""
+    return {
+        "investigation_id": investigation_id,
+        "user_id": user_id,
+        "started_at": datetime.now().isoformat(),
+        "alert_evidence": None,
+        "initial_evidence": None,
+        "agent_messages": [],
+        "tool_calls": [],
+        "tool_results": {},
+        "agent_iterations": 0,
+        "final_assessment": None,
+        "report_markdown": "",
+        "current_phase": "alert_validation",
+        "current_node": "start",
+        "workflow_status": "running",
+        "error_message": None,
+        "trace_events": [],
+    }
 
 logger = logging.getLogger('investigation.service')
 
@@ -23,10 +43,10 @@ MESH_BASE_URL = os.environ.get("MESH_BASE_URL", "http://synktron-meshruntime-loc
 WORKFLOW_MANIFEST = {
     "manifest": {
         "tasks": [
-            {"agentId": "alert-validation",  "order": 1, "name": "Alert Validation",  "isCritical": True},
-            {"agentId": "data-collection",   "order": 2, "name": "Data Collection",   "isCritical": True},
-            {"agentId": "llm-investigation", "order": 3, "name": "LLM Investigation", "isCritical": True},
-            {"agentId": "report-generation", "order": 4, "name": "Report Generation", "isCritical": True},
+            {"agentId": "alert_validation",  "order": 1, "name": "Alert Validation",  "isCritical": True},
+            {"agentId": "data_collection",   "order": 2, "name": "Data Collection",   "isCritical": True},
+            {"agentId": "llm_agent",         "order": 3, "name": "LLM Investigation", "isCritical": True},
+            {"agentId": "report_generation", "order": 4, "name": "Report Generation", "isCritical": True},
         ]
     }
 }
