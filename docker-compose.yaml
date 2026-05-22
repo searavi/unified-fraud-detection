@@ -80,6 +80,8 @@ services:
         condition: service_healthy
       aerospike-graph-service:
         condition: service_healthy
+      synktron-meshruntime-local:
+        condition: service_started
     environment:
       - AEROSPIKE_HOST=aerospike-db
       - AEROSPIKE_KV_PORT=3000
@@ -149,6 +151,17 @@ services:
       timeout: 10s
       retries: 5
       start_period: 15s
+
+  synktron-meshruntime-local:
+    image: synktron-meshruntime-local:latest
+    container_name: synktron-meshruntime-local
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Docker
+      - UseInMemoryStorage=true
+    networks:
+      - asgraph_net
+    ports:
+      - "5000:8080"
 
   # Monitoring Stack
   aerospike-exporter:
