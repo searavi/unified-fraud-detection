@@ -98,6 +98,7 @@ services:
       interval: 5s
       timeout: 10s
       retries: 4
+      start_period: 45s
     networks:
       - asgraph_net
     ports:
@@ -141,20 +142,32 @@ services:
       - AEROSPIKE_HOST=aerospike-db
       - AEROSPIKE_KV_PORT=3000
       - AEROSPIKE_NAMESPACE=test
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://localhost:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-mistral}
+    command: ["uvicorn", "service.main:app", "--host", "0.0.0.0", "--port", "8090"]
     networks:
-      - asgraph_net
+      asgraph_net:
+        aliases:
+          - synktron-aerospike-agents
     ports:
-      - "8000:8000"
+      - "8000:8090"
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health', timeout=5)"]
       interval: 10s
       timeout: 10s
       retries: 5
       start_period: 15s
 
   synktron-meshruntime-local:
-    image: synktron-meshruntime-local:latest
+    image: meshruntime:local-test
+    pull_policy: never
     container_name: synktron-meshruntime-local
+    depends_on:
+      agent-mongodb-1:
+        condition: service_healthy
     environment:
       - ASPNETCORE_ENVIRONMENT=Docker
       - UseInMemoryStorage=true
@@ -162,6 +175,22 @@ services:
       - asgraph_net
     ports:
       - "5000:8080"
+
+  agent-mongodb-1:
+    image: mongo:7.0
+    container_name: agent-mongodb-1
+    networks:
+      - asgraph_net
+    ports:
+      - "27018:27017"
+    volumes:
+      - agent_mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
 
   # Monitoring Stack
   aerospike-exporter:
@@ -220,5 +249,6 @@ networks:
 
 volumes:
   ollama_data:
+  agent_mongodb_data:
   prometheus_data:
   grafana_data:
