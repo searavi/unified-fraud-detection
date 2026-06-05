@@ -133,7 +133,7 @@ services:
   synktron-agent-service:
     build:
       context: ..
-      dockerfile: Agent/python/Dockerfile
+      dockerfile: Agent/src/Synktron.AgentFramework.Python.Service/Dockerfile
     container_name: synktron-agent-service
     depends_on:
       aerospike-db:
@@ -147,7 +147,8 @@ services:
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://localhost:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-mistral}
-    command: ["uvicorn", "service.main:app", "--host", "0.0.0.0", "--port", "8090"]
+      - PYTHONPATH=/app/src:/app/src/Synktron/AgentFramework/Python/Agents
+    command: ["uvicorn", "Synktron.AgentFramework.Python.Service.main:app", "--host", "0.0.0.0", "--port", "8090"]
     networks:
       asgraph_net:
         aliases:
@@ -161,6 +162,27 @@ services:
       retries: 5
       start_period: 15s
 
+  opa:
+    image: openpolicyagent/opa:latest-debug
+    container_name: synktron-opa
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "/policies/synchtron/authz.rego"
+      - "/policies/data.json"
+    volumes:
+      - ../Mesh/deployment/opa/policies:/policies:ro
+    networks:
+      - asgraph_net
+    ports:
+      - "8181:8181"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8181/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   synktron-meshruntime-local:
     image: meshruntime:local-test
     pull_policy: never
@@ -168,9 +190,12 @@ services:
     depends_on:
       agent-mongodb-1:
         condition: service_healthy
+      opa:
+        condition: service_healthy
     environment:
       - ASPNETCORE_ENVIRONMENT=Docker
       - UseInMemoryStorage=true
+      - Hitl__OpaBaseAddress=http://synktron-opa:8181
     networks:
       - asgraph_net
     ports:
