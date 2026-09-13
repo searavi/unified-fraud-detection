@@ -160,6 +160,12 @@ export interface InvestigationState {
   
   // Error
   error?: string;
+  errorCode?: string;
+}
+
+export interface PolicyActionState {
+  status: "idle" | "enabling" | "failed";
+  message?: string;
 }
 
 const initialState: InvestigationState = {
@@ -175,6 +181,7 @@ const initialState: InvestigationState = {
 
 export function useInvestigation() {
   const [state, setState] = useState<InvestigationState>(initialState);
+  const [policyAction, setPolicyAction] = useState<PolicyActionState>({ status: "idle" });
   const eventSourceRef = useRef<EventSource | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
@@ -302,11 +309,21 @@ export function useInvestigation() {
         // Handle 'progress' event
         eventSource.addEventListener("progress", (event) => {
           const data = JSON.parse(event.data);
-          
+
           setState((prev) => {
+            // This backend emits "progress" strictly in step order with no separate
+            // node-complete signal (unlike "trace" events) — a new node starting means the
+            // previous one finished. Mark it complete here so step UIs relying on
+            // completedSteps don't show it stuck "running" forever.
+            const newCompletedSteps =
+              prev.currentNode && !prev.completedSteps.includes(prev.currentNode)
+                ? [...prev.completedSteps, prev.currentNode]
+                : prev.completedSteps;
+
             const updates: Partial<InvestigationState> = {
               currentNode: data.node || prev.currentNode,
               currentPhase: data.phase || prev.currentPhase,
+              completedSteps: newCompletedSteps,
             };
 
             // Update evidence based on node
@@ -353,6 +370,24 @@ export function useInvestigation() {
           });
         });
 
+        // Handle 'state_update' event — carries the final InvestigationState (final_assessment,
+        // report_markdown, tool_calls, etc.) that the backend reads back from Aerospike KV once
+        // the Mesh workflow finishes. "complete" only flips status and carries no payload, so
+        // without this listener the live view never receives the actual results.
+        eventSource.addEventListener("state_update", (event) => {
+          const data = JSON.parse(event.data);
+          console.log("[Investigation] State update received:", data);
+          setState((prev) => ({
+            ...prev,
+            initialEvidence: data.initial_evidence ?? prev.initialEvidence,
+            finalAssessment: data.final_assessment ?? prev.finalAssessment,
+            toolCalls: data.tool_calls ?? prev.toolCalls,
+            agentIterations: data.agent_iterations ?? prev.agentIterations,
+            report: data.report_markdown ?? prev.report,
+            alertEvidence: data.alert_evidence ?? prev.alertEvidence,
+          }));
+        });
+
         // Handle 'metrics' event
         eventSource.addEventListener("metrics", (event) => {
           const data = JSON.parse(event.data);
@@ -370,13 +405,24 @@ export function useInvestigation() {
             ...prev,
             status: "completed",
             investigation_id: data.investigation_id,
+            // The last node from "progress" never gets superseded by a later one (there's no
+            // final node-complete signal) — mark it done now so it doesn't show as
+            // perpetually "running" once the investigation has actually finished.
+            completedSteps:
+              prev.currentNode && !prev.completedSteps.includes(prev.currentNode)
+                ? [...prev.completedSteps, prev.currentNode]
+                : prev.completedSteps,
           }));
           eventSource.close();
         });
 
-        // Handle 'error' event
-        eventSource.addEventListener("error", (event) => {
-          // Check if it's a custom error event or connection error
+        // Handle 'investigation_error' event — named distinctly from EventSource's native
+        // "error" event (used below for real connection drops). Reusing "error" as the SSE
+        // event name made the browser dispatch it to BOTH listeners for the same event object;
+        // since our handler closes the connection synchronously, the native handler then saw
+        // readyState === CLOSED within the same dispatch and clobbered the real message with
+        // "Connection lost".
+        eventSource.addEventListener("investigation_error", (event) => {
           if (event instanceof MessageEvent && event.data) {
             try {
               const data = JSON.parse(event.data);
@@ -384,11 +430,16 @@ export function useInvestigation() {
                 ...prev,
                 status: "error",
                 error: data.error || "Unknown error",
+                errorCode: data.errorCode,
               }));
             } catch {
-              // Not a custom error, likely connection issue
+              // Malformed event payload — leave state as-is.
             }
           }
+          // The backend ends the stream right after this event — close explicitly so
+          // native EventSource doesn't treat that as a dropped connection and reconnect,
+          // which would silently restart a brand-new investigation in a loop.
+          eventSource.close();
         });
 
         // Handle connection errors
@@ -416,6 +467,39 @@ export function useInvestigation() {
       }
     },
     [cleanup]
+  );
+
+  // Push a HITL policy authorizing this workflow + its agents, wait for OPA to pick it up, and
+  // re-trigger the investigation once verified. Used by the "Enable Workflow Execution" button
+  // shown when Mesh blocks a run with errorCode "hitl_policy_missing".
+  const enableWorkflowPolicy = useCallback(
+    async (userId: string) => {
+      setPolicyAction({ status: "enabling" });
+      try {
+        const response = await fetch(`${BACKEND_URL}/investigation/enable-workflow-policy`, {
+          method: "POST",
+        });
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok || !data.success || !data.verified) {
+          setPolicyAction({
+            status: "failed",
+            message: data.message || data.detail || "Failed to enable workflow policy",
+          });
+          return;
+        }
+
+        setPolicyAction({ status: "idle" });
+        // Policy is confirmed active — clear the old error and retry the investigation.
+        await startInvestigation(userId);
+      } catch (error) {
+        setPolicyAction({
+          status: "failed",
+          message: error instanceof Error ? error.message : "Failed to enable workflow policy",
+        });
+      }
+    },
+    [startInvestigation]
   );
 
   // Stop investigation
@@ -507,10 +591,12 @@ export function useInvestigation() {
   return {
     ...state,
     progress,
+    policyAction,
     startInvestigation,
     stopInvestigation,
     reset,
     getStepStatus,
     loadExistingInvestigation,
+    enableWorkflowPolicy,
   };
 }

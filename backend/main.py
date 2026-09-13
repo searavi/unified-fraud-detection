@@ -1423,6 +1423,25 @@ def get_investigation_steps():
         raise HTTPException(status_code=500, detail=f"Failed to get steps: {str(e)}")
 
 
+@app.post("/investigation/enable-workflow-policy")
+async def enable_workflow_policy():
+    """
+    Push a HITL policy to Mesh authorizing the fraud-investigation workflow and its agents to
+    execute, wait for OPA's bundle poll, and verify the policy is now active. Used by the
+    frontend's "Enable Workflow Execution" recovery action when Mesh blocks a run with
+    errorCode "hitl_policy_missing".
+    """
+    if not investigation_service:
+        raise HTTPException(status_code=503, detail="Investigation service not initialized")
+
+    try:
+        result = await investigation_service.enable_workflow_policy_and_wait()
+        return result
+    except Exception as e:
+        logger.error(f"❌ Failed to enable workflow policy: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to enable workflow policy: {str(e)}")
+
+
 @app.get("/investigation/{user_id}/stream")
 async def stream_investigation(
     user_id: str = Path(..., description="User ID to investigate"),
@@ -1436,7 +1455,9 @@ async def stream_investigation(
     - trace: Node execution trace events
     - progress: State updates from each node
     - complete: Investigation completed
-    - error: Error occurred
+    - investigation_error: Investigation failed (HITL block, agent failure, etc.) — named
+      distinctly from the browser's native EventSource "error" event so a custom listener
+      doesn't collide with connection-level error handling.
     """
     if not investigation_service:
         raise HTTPException(status_code=503, detail="Investigation service not initialized")
@@ -1460,7 +1481,7 @@ async def stream_investigation(
         except Exception as e:
             logger.error(f"Investigation stream error: {e}")
             yield {
-                "event": "error",
+                "event": "investigation_error",
                 "data": json.dumps({"error": str(e)})
             }
     

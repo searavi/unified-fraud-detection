@@ -12,3 +12,4 @@ apscheduler==3.10.4
 aerospike>=15.0.0
 sse-starlette>=1.6.5
 faker>=30.0.0
+docker>=7.0.0

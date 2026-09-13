@@ -80,19 +80,29 @@ services:
         condition: service_healthy
       aerospike-graph-service:
         condition: service_healthy
-      synktron-meshruntime-local:
-        condition: service_started
     environment:
       - AEROSPIKE_HOST=aerospike-db
       - AEROSPIKE_KV_PORT=3000
-      - MESH_BASE_URL=http://synktron-meshruntime-local:8080
+      # Mesh runs standalone via Mesh/scripts/test-container-locally.ps1 on the
+      # meshruntime-local-net network, reachable here via the `meshruntime` alias.
+      - MESH_BASE_URL=http://meshruntime:8080
       # LLM Provider: "gemini" or "ollama"
       - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
       # Gemini settings (used when LLM_PROVIDER=gemini)
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      # Local dev only: lets the "Enable Workflow Execution" recovery action flip Mesh's
+      # file-mount OPA sidecar to permissive_mode directly, since that OPA reads this file once
+      # at container start and never polls Mesh's policy API (no bundle-service config there).
+      - OPA_POLICY_FILE=/opa-policies/data.json
+      - OPA_CONTAINER_NAME=opa-sidecar-local-test
     volumes:
       - ./data:/data
+      - ../Mesh/deployment/opa/policies:/opa-policies
+      # Grants this container control of the host's Docker daemon (equivalent to root on the
+      # host) so it can restart the OPA sidecar after editing its policy file above — local dev
+      # convenience only, never do this in a real deployment.
+      - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://0.0.0.0:4000/health"]
       interval: 5s
@@ -101,6 +111,7 @@ services:
       start_period: 45s
     networks:
       - asgraph_net
+      - meshruntime-local-net
     ports:
       - "4000:4000"
   frontend:
@@ -117,7 +128,7 @@ services:
     networks:
       - asgraph_net
     ports:
-      - "8080:8080"
+      - "8081:8080"
   generator:
     build:
       context: .
@@ -144,7 +155,7 @@ services:
       - AEROSPIKE_NAMESPACE=test
       - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash-lite}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://localhost:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-mistral}
       - PYTHONPATH=/app/src:/app/src/Synktron/AgentFramework/Python/Agents
@@ -162,60 +173,10 @@ services:
       retries: 5
       start_period: 15s
 
-  opa:
-    image: openpolicyagent/opa:latest-debug
-    container_name: synktron-opa
-    command:
-      - "run"
-      - "--server"
-      - "--addr=0.0.0.0:8181"
-      - "/policies/synchtron/authz.rego"
-      - "/policies/data.json"
-    volumes:
-      - ../Mesh/deployment/opa/policies:/policies:ro
-    networks:
-      - asgraph_net
-    ports:
-      - "8181:8181"
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8181/health"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  synktron-meshruntime-local:
-    image: meshruntime:local-test
-    pull_policy: never
-    container_name: synktron-meshruntime-local
-    depends_on:
-      agent-mongodb-1:
-        condition: service_healthy
-      opa:
-        condition: service_healthy
-    environment:
-      - ASPNETCORE_ENVIRONMENT=Docker
-      - UseInMemoryStorage=true
-      - Hitl__OpaBaseAddress=http://synktron-opa:8181
-    networks:
-      - asgraph_net
-    ports:
-      - "5000:8080"
-
-  agent-mongodb-1:
-    image: mongo:7.0
-    container_name: agent-mongodb-1
-    networks:
-      - asgraph_net
-    ports:
-      - "27018:27017"
-    volumes:
-      - agent_mongodb_data:/data/db
-    healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
-      interval: 10s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
+  # Mesh is run standalone via Mesh/scripts/test-container-locally.ps1, not built here.
+  # That script starts its own OPA sidecar, local auth signing keys, and Mongo/Azurite deps,
+  # and publishes the container on the external `meshruntime-local-net` network (alias `meshruntime`)
+  # joined by the `backend` service below. Run it before `docker compose up`.
 
   # Monitoring Stack
   aerospike-exporter:
@@ -271,6 +232,10 @@ services:
 networks:
   asgraph_net:
     name: asgraph_net
+  # Created by Mesh/scripts/test-container-locally.ps1 (Ensure-LocalNetwork). Run that script
+  # before `docker compose up` so this network exists — compose will not create it.
+  meshruntime-local-net:
+    external: true
 
 volumes:
   ollama_data:

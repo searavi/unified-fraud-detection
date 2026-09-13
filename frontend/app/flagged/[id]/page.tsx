@@ -26,7 +26,9 @@ import {
     Brain,
     PlayCircle,
     StopCircle,
-    RefreshCw
+    RefreshCw,
+    XCircle,
+    Loader2
 } from 'lucide-react'
 import ReviewWorkflow from '@/components/Flagged/Details/ReviewWorkflow'
 import GraphVisualization from '@/components/Flagged/Details/GraphVisualization'
@@ -141,6 +143,13 @@ export default function FlaggedAccountDetailsPage() {
         investigation.stopInvestigation()
     }
 
+    const handleEnableWorkflowPolicy = () => {
+        if (account) {
+            investigation.enableWorkflowPolicy(account.user_id)
+            setActiveTab('investigation')
+        }
+    }
+
     // Loading state
     if (loading) {
         return <LoadingSkeleton />
@@ -229,6 +238,41 @@ export default function FlaggedAccountDetailsPage() {
                     </div>
                 </div>
             </div>
+
+            {/* AI Investigation Error Banner */}
+            {investigation.status === 'error' && investigation.error && (
+                <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+                    <div className="flex items-start gap-3">
+                        <XCircle className="h-5 w-5 text-red-600 mt-0.5" />
+                        <div className="flex-1">
+                            <h3 className="font-semibold text-red-800">AI Investigation Failed</h3>
+                            <p className="text-sm text-red-700 mt-1">{investigation.error}</p>
+                            {investigation.policyAction.status === 'failed' && investigation.policyAction.message && (
+                                <p className="text-sm text-red-800 font-medium mt-2">
+                                    {investigation.policyAction.message}
+                                </p>
+                            )}
+                            {investigation.errorCode === 'hitl_policy_missing' && (
+                                <Button
+                                    onClick={handleEnableWorkflowPolicy}
+                                    disabled={investigation.policyAction.status === 'enabling'}
+                                    size="sm"
+                                    className="mt-3 bg-indigo-600 hover:bg-indigo-700 text-white"
+                                >
+                                    {investigation.policyAction.status === 'enabling' ? (
+                                        <>
+                                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                            Enabling workflow execution...
+                                        </>
+                                    ) : (
+                                        'Enable Workflow Execution'
+                                    )}
+                                </Button>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Main Content Grid */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">

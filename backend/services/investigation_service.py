@@ -6,12 +6,14 @@ Provides SSE streaming for real-time investigation progress.
 """
 
 import asyncio
+import json
 import os
 import uuid
 import logging
 from datetime import datetime
 from typing import Dict, Any, AsyncGenerator, Optional
 
+import docker
 import httpx
 
 
@@ -60,6 +62,38 @@ WORKFLOW_STEPS = [
 
 STEP_NAMES = ["alert_validation", "data_collection", "llm_investigation", "report_generation"]
 
+# Mesh reports HITL/policy outcomes via the response body's errorCode, not the HTTP status —
+# a 200 can carry status="Failed" or "AwaitingApproval". Mesh's own `error` text is already a
+# clear sentence for each of these; just label it with a short, code-derived category.
+MESH_HITL_ERROR_LABELS = {
+    "hitl_policy_missing": "No HITL policy configured",
+    "hitl_policy_denied": "HITL policy denied",
+    "MESH_HITL_APPROVAL_REQUIRED": "Awaiting human approval",
+}
+
+# The local Mesh/OPA sidecar (test-container-locally.ps1) runs OPA in file-mount mode: it reads
+# this file once at container start and has no bundle-service config, so it never polls Mesh's
+# HITL policy API (PUT /api/v1/hitl/policies/{tenantId} would write to Azure Blob storage this
+# OPA never looks at). The only way to change what it enforces is to edit this file directly and
+# restart the container so OPA re-reads it.
+OPA_POLICY_FILE = os.environ.get("OPA_POLICY_FILE", "/opa-policies/data.json")
+OPA_CONTAINER_NAME = os.environ.get("OPA_CONTAINER_NAME", "opa-sidecar-local-test")
+# A restart, not a poll interval — OPA re-reads the file on boot, so a few seconds covers
+# container stop/start; there is nothing to "propagate" beyond that.
+OPA_RESTART_WAIT_SECONDS = 5
+
+PERMISSIVE_POLICY_DATA = {
+    "permissive_mode": True,
+    "workflow_policies": [],
+    "agent_policies": [],
+    "executor_groups": [],
+    "executor_roles": [],
+    "approver_groups": [],
+    "approver_roles": [],
+    "workflow_approvals": {},
+    "agent_approvals": {},
+}
+
 
 class InvestigationService:
     """
@@ -81,6 +115,20 @@ class InvestigationService:
         self._investigation_results: Dict[str, Dict[str, Any]] = {}
         logger.info(f"Investigation service initialized — Mesh at {self._mesh_base_url}")
 
+    async def _mesh_auth_header(self) -> Dict[str, str]:
+        """Fetch (or reuse) a local-dev bearer token for authenticated Mesh calls.
+
+        Mesh's workflow endpoints require JWT claims (ExtractHitlContextFromClaims) —
+        an unauthenticated call gets a 401. The /local/token endpoint is
+        [AllowAnonymous] and non-production only, matching this local Docker setup.
+        """
+        response = await self._mesh_client.get(
+            f"{self._mesh_base_url}/api/v1/mesh/security/local/token",
+        )
+        response.raise_for_status()
+        token = response.json()["token"]
+        return {"Authorization": f"Bearer {token}"}
+
     async def initialize(self):
         """Register workflow manifest with Mesh and store the workflow ID."""
         try:
@@ -92,9 +140,11 @@ class InvestigationService:
 
     async def _create_mesh_workflow(self) -> str:
         """POST AgentManifest to Mesh and return the workflowId."""
+        headers = await self._mesh_auth_header()
         response = await self._mesh_client.post(
             f"{self._mesh_base_url}/api/workflow/create",
             json=WORKFLOW_MANIFEST,
+            headers=headers,
         )
         response.raise_for_status()
         data = response.json()
@@ -106,6 +156,62 @@ class InvestigationService:
         if not workflow_id:
             raise ValueError(f"Mesh did not return a workflowId: {data}")
         return workflow_id
+
+    async def enable_workflow_policy_and_wait(self) -> Dict[str, Any]:
+        """Flip the local OPA sidecar to permissive mode and restart it so the change takes
+        effect. This OPA runs in file-mount mode (test-container-locally.ps1): it reads
+        OPA_POLICY_FILE once at container start and has no bundle-service config, so it never
+        polls Mesh's HITL policy API — a container restart, not a propagation wait, is what
+        actually applies a new policy here.
+
+        Returns {"success": bool, "verified": bool, "message": str}.
+        """
+        try:
+            with open(OPA_POLICY_FILE, "w") as f:
+                json.dump(PERMISSIVE_POLICY_DATA, f, indent=2)
+        except OSError as e:
+            logger.error(f"Failed to write OPA policy file {OPA_POLICY_FILE}: {e}")
+            return {"success": False, "verified": False, "message": f"Failed to write policy file: {e}"}
+
+        try:
+            client = await asyncio.to_thread(docker.from_env)
+            container = await asyncio.to_thread(client.containers.get, OPA_CONTAINER_NAME)
+            await asyncio.to_thread(container.restart, timeout=10)
+        except docker.errors.NotFound:
+            logger.error(f"OPA container '{OPA_CONTAINER_NAME}' not found")
+            return {
+                "success": False,
+                "verified": False,
+                "message": f"OPA container '{OPA_CONTAINER_NAME}' not found — is Mesh running?",
+            }
+        except docker.errors.DockerException as e:
+            logger.error(f"Failed to restart OPA container '{OPA_CONTAINER_NAME}': {e}")
+            return {"success": False, "verified": False, "message": f"Failed to restart OPA: {e}"}
+
+        logger.info(
+            f"OPA container '{OPA_CONTAINER_NAME}' set to permissive mode and restarted — "
+            f"waiting {OPA_RESTART_WAIT_SECONDS}s for it to come back up"
+        )
+        await asyncio.sleep(OPA_RESTART_WAIT_SECONDS)
+
+        try:
+            await asyncio.to_thread(container.reload)
+            running = container.status == "running"
+        except docker.errors.DockerException as e:
+            logger.error(f"Failed to verify OPA container status: {e}")
+            return {
+                "success": True,
+                "verified": False,
+                "message": f"Policy file updated and OPA restart requested, but could not confirm it came back up: {e}",
+            }
+
+        if running:
+            return {"success": True, "verified": True, "message": "OPA is now running in permissive mode."}
+        return {
+            "success": True,
+            "verified": False,
+            "message": f"Policy file updated, but OPA container is not running (status: {container.status}).",
+        }
 
     async def close(self):
         """Clean up resources."""
@@ -160,6 +266,7 @@ class InvestigationService:
                 logger.info(f"Initial state written for {investigation_id}")
 
             # Launch Mesh workflow execution as background task
+            mesh_headers = await self._mesh_auth_header()
             execute_task = asyncio.create_task(
                 self._mesh_client.post(
                     f"{self._mesh_base_url}/api/workflow/{self._mesh_workflow_id}/execute",
@@ -170,37 +277,55 @@ class InvestigationService:
                             "user_id": user_id,
                         },
                     },
+                    headers=mesh_headers,
                 )
             )
 
-            # Poll for progress while Mesh runs the workflow
+            # POST {workflowId}/execute blocks until the workflow finishes (or pauses on HITL),
+            # so there's no run id to poll status against while it's in flight — Mesh only
+            # returns WorkflowExecutionId in the response body once execute_task completes.
+            # Just wait for it; remaining progress steps are emitted below in one burst.
             emitted_steps = 0
             while not execute_task.done():
                 await asyncio.sleep(2)
-                try:
-                    status_resp = await self._mesh_client.get(
-                        f"{self._mesh_base_url}/api/workflow/status/{investigation_id}",
-                        timeout=5.0,
-                    )
-                    if status_resp.status_code == 200:
-                        completed = status_resp.json().get("completedSteps", 0)
-                        while emitted_steps < completed and emitted_steps < len(STEP_NAMES):
-                            yield {
-                                "event": "progress",
-                                "data": {
-                                    "node": STEP_NAMES[emitted_steps],
-                                    "phase": STEP_NAMES[emitted_steps],
-                                },
-                            }
-                            if investigation_id in self._active_investigations:
-                                self._active_investigations[investigation_id]["current_step"] = STEP_NAMES[emitted_steps]
-                            emitted_steps += 1
-                except Exception:
-                    pass  # status poll is best-effort
 
             # Collect Mesh response
             mesh_resp = execute_task.result()
             mesh_resp.raise_for_status()
+            mesh_body = mesh_resp.json()
+
+            # Mesh reports HITL/policy outcomes in the body, not the HTTP status — a 200 can carry
+            # status="Failed" (errorCode "hitl_policy_missing"/"hitl_policy_denied") or
+            # "AwaitingApproval" (errorCode "MESH_HITL_APPROVAL_REQUIRED", Gate 4/5 paused for a
+            # human). Only "Completed" means the agents actually ran.
+            mesh_status = mesh_body.get("status")
+            if mesh_status != "Completed":
+                error_code = mesh_body.get("errorCode")
+                reason = mesh_body.get("error") or mesh_body.get("message") or "Unknown Mesh failure"
+                label = MESH_HITL_ERROR_LABELS.get(error_code)
+                error_message = f"{label}: {reason}" if label else reason
+
+                logger.error(
+                    f"Investigation {investigation_id} blocked by Mesh — status={mesh_status} "
+                    f"errorCode={error_code}: {error_message}"
+                )
+                yield {
+                    "event": "investigation_error",
+                    "data": {
+                        "error": error_message,
+                        "errorCode": error_code,
+                        "investigation_id": investigation_id,
+                    },
+                }
+                if investigation_id in self._active_investigations:
+                    status_label = "awaiting_approval" if mesh_status == "AwaitingApproval" else "blocked"
+                    self._active_investigations[investigation_id]["status"] = status_label
+                    self._active_investigations[investigation_id]["error"] = error_message
+                return
+
+            mesh_run_id = mesh_body.get("workflowExecutionId")
+            if mesh_run_id and investigation_id in self._active_investigations:
+                self._active_investigations[investigation_id]["mesh_run_id"] = mesh_run_id
 
             # Emit any remaining progress steps
             while emitted_steps < len(STEP_NAMES):
@@ -260,7 +385,7 @@ class InvestigationService:
         except Exception as e:
             logger.error(f"Investigation error: {e}")
             yield {
-                "event": "error",
+                "event": "investigation_error",
                 "data": {"error": str(e), "investigation_id": investigation_id},
             }
             if investigation_id in self._active_investigations:

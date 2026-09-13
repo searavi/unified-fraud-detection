@@ -73,7 +73,9 @@ const workflowSteps = [
     {
         title: 'Risk Assessment',
         description: 'Evaluate overall risk level and potential impact',
-        aiSteps: ['llm_agent', 'report_generation']
+        // Matches the "progress" event's node id (STEP_NAMES in investigation_service.py),
+        // not the Mesh agentId ("llm_agent") — a different identifier space entirely.
+        aiSteps: ['llm_investigation', 'report_generation']
     },
     {
         title: 'Decision & Documentation',
@@ -230,7 +232,14 @@ const ReviewWorkflow = ({
             if (stepIndex === 3) return 'current'  // Step 3 (Human Decision) is current
             return 'upcoming'
         }
-        
+
+        // Mesh blocked or the investigation otherwise failed (e.g. HITL policy denial) — none
+        // of the AI steps actually ran, so don't fall through to the manual-nav default below,
+        // which would misread stale `currentStep` state as real progress.
+        if (investigationStatus === 'error') {
+            return 'upcoming'
+        }
+
         // Check if AI steps for this workflow step are running
         if (investigationStatus === 'running') {
             // Step 3 (Human Decision) has no AI substeps - always upcoming during AI run
