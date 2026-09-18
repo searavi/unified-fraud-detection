@@ -1,0 +1,73 @@
+name: Fraud Detection Demo Lifecycle
+
+# Stands up or tears down the fraud-detection demo's Azure resources (ACA backend + frontend)
+# against the cloud-deployed Mesh instance. See scripts/deploy-fraud-detection-to-azure.ps1 and
+# scripts/teardown-fraud-detection-azure.ps1 for what each action actually does.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'up = deploy the demo, down = tear it down'
+        required: true
+        type: choice
+        options:
+          - up
+          - down
+      imageTag:
+        description: 'Image tag to build/deploy (only used for "up")'
+        default: 'latest'
+        type: string
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # Reuses the same OIDC app + tenant as Mesh's own deploy-template.yml — that app already
+      # holds RBAC in the synchtrontrial subscription (Mesh/Web already deploy there through it).
+      # If this repo's federated-credential subject was never added for this app registration,
+      # this step fails with an unambiguous AADSTS70021 — see this repo's PR/session notes for
+      # how to add one if that happens.
+      - name: Azure Login
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.SYNCHTRONTRIAL_SUBSCRIPTION_ID }}
+
+      # TODO: pin to a specific commit SHA once one has been verified (matching this org's
+      # convention on every other third-party action) — left as a version tag because no prior
+      # pinned SHA for this action exists anywhere in this org's workflows to reuse, and a
+      # fabricated SHA would be worse than an unpinned tag.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install -r backend/requirements.txt
+
+      - name: Deploy
+        if: inputs.action == 'up'
+        shell: pwsh
+        run: |
+          ./scripts/deploy-fraud-detection-to-azure.ps1 `
+            -ImageTag '${{ inputs.imageTag }}' `
+            -MeshBaseUrl '${{ vars.FRAUD_DEMO_MESH_BASE_URL }}' `
+            -MongoConnectionString '${{ secrets.FRAUD_DEMO_MESH_MONGO_CONNECTION_STRING }}' `
+            -EntraTenantId '${{ vars.AZURE_TENANT_ID }}' `
+            -EntraClientId '${{ secrets.FRAUD_DEMO_ENTRA_CLIENT_ID }}' `
+            -EntraClientSecret '${{ secrets.FRAUD_DEMO_ENTRA_CLIENT_SECRET }}'
+
+      - name: Teardown
+        if: inputs.action == 'down'
+        shell: pwsh
+        run: |
+          ./scripts/teardown-fraud-detection-azure.ps1 `
+            -MeshBaseUrl '${{ vars.FRAUD_DEMO_MESH_BASE_URL }}' `
+            -MongoConnectionString '${{ secrets.FRAUD_DEMO_MESH_MONGO_CONNECTION_STRING }}'

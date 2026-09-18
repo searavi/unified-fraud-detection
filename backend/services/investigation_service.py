@@ -6,14 +6,12 @@ Provides SSE streaming for real-time investigation progress.
 """
 
 import asyncio
-import json
 import os
 import uuid
 import logging
 from datetime import datetime
 from typing import Dict, Any, AsyncGenerator, Optional
 
-import docker
 import httpx
 
 
@@ -42,8 +40,14 @@ logger = logging.getLogger('investigation.service')
 
 MESH_BASE_URL = os.environ.get("MESH_BASE_URL", "http://synktron-meshruntime-local:8080")
 
+# Tags every workflow this service registers so a reset/teardown script can find and remove
+# exactly these entries out of Mesh's shared operational store and HITL policy document —
+# never a blanket delete/overwrite, since other demos share the same Mesh deployment and tenant.
+DEMO_SOURCE_TAG = "fraud-detection-demo"
+
 WORKFLOW_MANIFEST = {
     "manifest": {
+        "metadata": {"source": DEMO_SOURCE_TAG},
         "tasks": [
             {"agentId": "alert_validation",  "order": 1, "name": "Alert Validation",  "isCritical": True},
             {"agentId": "data_collection",   "order": 2, "name": "Data Collection",   "isCritical": True},
@@ -71,28 +75,20 @@ MESH_HITL_ERROR_LABELS = {
     "MESH_HITL_APPROVAL_REQUIRED": "Awaiting human approval",
 }
 
-# The local Mesh/OPA sidecar (test-container-locally.ps1) runs OPA in file-mount mode: it reads
-# this file once at container start and has no bundle-service config, so it never polls Mesh's
-# HITL policy API (PUT /api/v1/hitl/policies/{tenantId} would write to Azure Blob storage this
-# OPA never looks at). The only way to change what it enforces is to edit this file directly and
-# restart the container so OPA re-reads it.
-OPA_POLICY_FILE = os.environ.get("OPA_POLICY_FILE", "/opa-policies/data.json")
-OPA_CONTAINER_NAME = os.environ.get("OPA_CONTAINER_NAME", "opa-sidecar-local-test")
-# A restart, not a poll interval — OPA re-reads the file on boot, so a few seconds covers
-# container stop/start; there is nothing to "propagate" beyond that.
-OPA_RESTART_WAIT_SECONDS = 5
+# Mesh and OPA share a network namespace (test-container-locally.ps1): OPA polls Mesh's
+# internal/hitl/opa-bundle endpoint every 1-2s and serves whatever's in Mesh's own IPolicyStore
+# for this tenant. PUT /api/v1/hitl/policies/{tenantId} is therefore a real, near-instant policy
+# update — no file write, no container restart.
+HITL_TENANT_ID = os.environ.get("HITL_TENANT_ID", "default")
+# Comfortably above OPA's max_delay_seconds=2 polling interval.
+POLICY_PROPAGATION_WAIT_SECONDS = 3
 
-PERMISSIVE_POLICY_DATA = {
-    "permissive_mode": True,
-    "workflow_policies": [],
-    "agent_policies": [],
-    "executor_groups": [],
-    "executor_roles": [],
-    "approver_groups": [],
-    "approver_roles": [],
-    "workflow_approvals": {},
-    "agent_approvals": {},
-}
+# Roles carried by the /local/token admin token (TokenService.CreateMeshTokenAsync adds both
+# when MeshUser.IsAdmin is true) — authz.rego's Gate 3 (execute_workflow) checks
+# input.context.roles against this list regardless of which workflow is being executed, so this
+# is who may execute, not which workflow. "Which workflow" and "which agents" are scoped
+# separately below via workflow_policies/agent_policies.
+EXECUTOR_ROLES = ["admin", "mesh.admin"]
 
 
 class InvestigationService:
@@ -115,13 +111,21 @@ class InvestigationService:
         self._investigation_results: Dict[str, Dict[str, Any]] = {}
         logger.info(f"Investigation service initialized — Mesh at {self._mesh_base_url}")
 
-    async def _mesh_auth_header(self) -> Dict[str, str]:
-        """Fetch (or reuse) a local-dev bearer token for authenticated Mesh calls.
+    async def _mesh_auth_header(self, mesh_token: Optional[str] = None) -> Dict[str, str]:
+        """Builds the Authorization header for a Mesh call.
 
-        Mesh's workflow endpoints require JWT claims (ExtractHitlContextFromClaims) —
-        an unauthenticated call gets a 401. The /local/token endpoint is
-        [AllowAnonymous] and non-production only, matching this local Docker setup.
+        When a real logged-in user's token is available (mesh_token, from the browser's
+        session — see main.py's /auth/callback), it's used as-is: Mesh validates it directly,
+        no Mesh-side exchange, matching Web's own proxyMeshAdminRequest pattern. Otherwise falls
+        back to minting a local-dev token: Mesh's workflow endpoints require JWT claims
+        (ExtractHitlContextFromClaims) — an unauthenticated call gets a 401. The /local/token
+        endpoint is [AllowAnonymous] and non-production only, matching local Docker setups —
+        this fallback path is unreachable once a real IdP is configured (see auth_service.py)
+        and the caller has actually logged in.
         """
+        if mesh_token:
+            return {"Authorization": f"Bearer {mesh_token}"}
+
         response = await self._mesh_client.get(
             f"{self._mesh_base_url}/api/v1/mesh/security/local/token",
         )
@@ -157,60 +161,168 @@ class InvestigationService:
             raise ValueError(f"Mesh did not return a workflowId: {data}")
         return workflow_id
 
-    async def enable_workflow_policy_and_wait(self) -> Dict[str, Any]:
-        """Flip the local OPA sidecar to permissive mode and restart it so the change takes
-        effect. This OPA runs in file-mount mode (test-container-locally.ps1): it reads
-        OPA_POLICY_FILE once at container start and has no bundle-service config, so it never
-        polls Mesh's HITL policy API — a container restart, not a propagation wait, is what
-        actually applies a new policy here.
+    # HITL policy defaults matching PolicyData's own fail-closed defaults (Mesh returns 404 for
+    # a tenant with no document yet — GET_DEFAULT_POLICY is what "nothing configured" means).
+    _DEFAULT_POLICY: Dict[str, Any] = {
+        "permissive_mode": False,
+        "workflow_policies": [],
+        "agent_policies": [],
+        "executor_groups": [],
+        "executor_roles": [],
+        "approver_groups": [],
+        "approver_roles": [],
+        "workflow_approvals": {},
+        "agent_approvals": {},
+    }
+
+    async def _mesh_get_policy(self, headers: Dict[str, str]) -> Dict[str, Any]:
+        """Fetches the tenant's current HITL policy document, or the fail-closed defaults if
+        none exists yet (Mesh returns 404 for an unconfigured tenant).
+        """
+        response = await self._mesh_client.get(
+            f"{self._mesh_base_url}/api/v1/hitl/policies/{HITL_TENANT_ID}",
+            headers=headers,
+        )
+        if response.status_code == 404:
+            return dict(self._DEFAULT_POLICY)
+        response.raise_for_status()
+        return response.json()
+
+    def _merge_allow_into(self, current: Dict[str, Any]) -> Dict[str, Any]:
+        """Merges this workflow's + its agents' allow/approval entries into an EXISTING policy
+        document, touching nothing else. This Mesh deployment may be shared by other demos
+        running their own workflows/agents in parallel — OpaBundleController only ever bundles
+        ONE tenant's document to OPA, so a blanket overwrite (or a blanket permissive_mode) would
+        blow away or blanket-allow everyone else's concurrently-configured policy, not just leave
+        it alone. Never touches permissive_mode/executor_*/approver_* — those are shared,
+        environment-wide settings, not this demo's to set (EXECUTOR_ROLES is only ever
+        union-added, never removed, so an already-present role from another demo/operator is
+        preserved). See authz.rego:
+          - Gates 1/2 (workflow_policies/agent_policies): exact-id allowlists, union-added here.
+          - Gate 3 (execute_workflow, gated on EXECUTOR_ROLES): who may execute, orthogonal to
+            which workflow.
+          - Gate 4 (workflow_approved) and the Agent Execution/Policy Gates (agent_approved,
+            step_execute_agent): a SEPARATE approval layer, deliberately distinct from Gates 1-3
+            (policy configuration vs. explicit sign-off on this specific run) — checked via
+            data.workflow_approvals/data.agent_approvals regardless of Gates 1-3 passing, so both
+            must be populated too, or the workflow pauses on "not explicitly approved for
+            execution" even with the right policy configured.
+        """
+        agent_ids = [task["agentId"] for task in WORKFLOW_MANIFEST["manifest"]["tasks"]]
+
+        workflow_policies = list(current.get("workflow_policies", []))
+        if self._mesh_workflow_id not in workflow_policies:
+            workflow_policies.append(self._mesh_workflow_id)
+
+        agent_policies = list(current.get("agent_policies", []))
+        for agent_id in agent_ids:
+            if agent_id not in agent_policies:
+                agent_policies.append(agent_id)
+
+        executor_roles = list(current.get("executor_roles", []))
+        for role in EXECUTOR_ROLES:
+            if role not in executor_roles:
+                executor_roles.append(role)
+
+        workflow_approvals = dict(current.get("workflow_approvals", {}))
+        workflow_approvals[self._mesh_workflow_id] = {"approved": True}
+
+        agent_approvals = dict(current.get("agent_approvals", {}))
+        for agent_id in agent_ids:
+            agent_approvals[agent_id] = {"approved": True}
+
+        merged = dict(current)
+        merged["workflow_policies"] = workflow_policies
+        merged["agent_policies"] = agent_policies
+        merged["executor_roles"] = executor_roles
+        merged["workflow_approvals"] = workflow_approvals
+        merged["agent_approvals"] = agent_approvals
+        return merged
+
+    async def enable_workflow_policy_and_wait(self, mesh_token: Optional[str] = None) -> Dict[str, Any]:
+        """GET the tenant's current HITL policy, merge in an allow for exactly this workflow and
+        its own agents, PUT the merged document back, and wait for OPA's next bundle poll to pick
+        it up. No file write, no container restart — Mesh and OPA share a network namespace and
+        OPA polls Mesh's internal/hitl/opa-bundle endpoint every 1-2s.
+
+        mesh_token: the logged-in caller's real token (see main.py's session handling), used
+        as-is if provided; falls back to the local-dev /local/token shortcut otherwise.
 
         Returns {"success": bool, "verified": bool, "message": str}.
         """
-        try:
-            with open(OPA_POLICY_FILE, "w") as f:
-                json.dump(PERMISSIVE_POLICY_DATA, f, indent=2)
-        except OSError as e:
-            logger.error(f"Failed to write OPA policy file {OPA_POLICY_FILE}: {e}")
-            return {"success": False, "verified": False, "message": f"Failed to write policy file: {e}"}
+        if not self._mesh_workflow_id:
+            await self.initialize()
 
         try:
-            client = await asyncio.to_thread(docker.from_env)
-            container = await asyncio.to_thread(client.containers.get, OPA_CONTAINER_NAME)
-            await asyncio.to_thread(container.restart, timeout=10)
-        except docker.errors.NotFound:
-            logger.error(f"OPA container '{OPA_CONTAINER_NAME}' not found")
+            headers = await self._mesh_auth_header(mesh_token)
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to fetch Mesh admin token: {e}")
+            return {"success": False, "verified": False, "message": f"Failed to authenticate to Mesh: {e}"}
+
+        try:
+            current = await self._mesh_get_policy(headers)
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to fetch current Mesh policy: {e}")
+            return {"success": False, "verified": False, "message": f"Failed to fetch current Mesh policy: {e}"}
+
+        merged = self._merge_allow_into(current)
+        try:
+            response = await self._mesh_client.put(
+                f"{self._mesh_base_url}/api/v1/hitl/policies/{HITL_TENANT_ID}",
+                json=merged,
+                headers=headers,
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Mesh rejected policy update: {e.response.status_code} {e.response.text}")
             return {
                 "success": False,
                 "verified": False,
-                "message": f"OPA container '{OPA_CONTAINER_NAME}' not found — is Mesh running?",
+                "message": f"Mesh rejected policy update ({e.response.status_code}): {e.response.text}",
             }
-        except docker.errors.DockerException as e:
-            logger.error(f"Failed to restart OPA container '{OPA_CONTAINER_NAME}': {e}")
-            return {"success": False, "verified": False, "message": f"Failed to restart OPA: {e}"}
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to reach Mesh policy API: {e}")
+            return {"success": False, "verified": False, "message": f"Failed to reach Mesh: {e}"}
 
         logger.info(
-            f"OPA container '{OPA_CONTAINER_NAME}' set to permissive mode and restarted — "
-            f"waiting {OPA_RESTART_WAIT_SECONDS}s for it to come back up"
+            f"Policy for tenant '{HITL_TENANT_ID}' merged to allow workflow '{self._mesh_workflow_id}' "
+            f"and its agents — waiting {POLICY_PROPAGATION_WAIT_SECONDS}s for OPA's next bundle poll"
         )
-        await asyncio.sleep(OPA_RESTART_WAIT_SECONDS)
+        await asyncio.sleep(POLICY_PROPAGATION_WAIT_SECONDS)
 
+        agent_ids = [task["agentId"] for task in WORKFLOW_MANIFEST["manifest"]["tasks"]]
         try:
-            await asyncio.to_thread(container.reload)
-            running = container.status == "running"
-        except docker.errors.DockerException as e:
-            logger.error(f"Failed to verify OPA container status: {e}")
+            fetched = await self._mesh_get_policy(headers)
+            fetched_workflow_approvals = fetched.get("workflow_approvals", {})
+            fetched_agent_approvals = fetched.get("agent_approvals", {})
+            verified = (
+                self._mesh_workflow_id in fetched.get("workflow_policies", [])
+                and set(agent_ids) <= set(fetched.get("agent_policies", []))
+                and set(EXECUTOR_ROLES) & set(fetched.get("executor_roles", []))
+                and fetched_workflow_approvals.get(self._mesh_workflow_id, {}).get("approved") is True
+                and all(
+                    fetched_agent_approvals.get(agent_id, {}).get("approved") is True
+                    for agent_id in agent_ids
+                )
+            )
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to verify policy update: {e}")
             return {
                 "success": True,
                 "verified": False,
-                "message": f"Policy file updated and OPA restart requested, but could not confirm it came back up: {e}",
+                "message": f"Policy PUT succeeded but could not verify it stuck: {e}",
             }
 
-        if running:
-            return {"success": True, "verified": True, "message": "OPA is now running in permissive mode."}
+        if verified:
+            return {
+                "success": True,
+                "verified": True,
+                "message": f"Workflow '{self._mesh_workflow_id}' and its agents are now allowed to execute.",
+            }
         return {
             "success": True,
             "verified": False,
-            "message": f"Policy file updated, but OPA container is not running (status: {container.status}).",
+            "message": "Policy PUT succeeded but Mesh does not report the expected scoped policy on read-back.",
         }
 
     async def close(self):
@@ -241,6 +353,7 @@ class InvestigationService:
         self,
         user_id: str,
         investigation_id: Optional[str] = None,
+        mesh_token: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         if not investigation_id:
             investigation_id = await self.start_investigation(user_id)
@@ -266,7 +379,7 @@ class InvestigationService:
                 logger.info(f"Initial state written for {investigation_id}")
 
             # Launch Mesh workflow execution as background task
-            mesh_headers = await self._mesh_auth_header()
+            mesh_headers = await self._mesh_auth_header(mesh_token)
             execute_task = asyncio.create_task(
                 self._mesh_client.post(
                     f"{self._mesh_base_url}/api/workflow/{self._mesh_workflow_id}/execute",

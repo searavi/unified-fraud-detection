@@ -1,0 +1,70 @@
+name: Fraud Detection Demo Lifecycle (AWS)
+
+# Stands up or tears down the fraud-detection demo's AWS resources (ECS Fargate backend +
+# frontend, sharing Mesh's existing EC2 Mongo + Cognito user pool). See
+# scripts/deploy-fraud-detection-to-aws.ps1 and scripts/teardown-fraud-detection-aws.ps1 for
+# what each action actually does. scripts/aws/setup-fraud-detection-iam.ps1 must be run once,
+# manually, by a human with IAM admin rights, before this workflow can authenticate at all.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'up = deploy the demo, down = tear it down'
+        required: true
+        type: choice
+        options:
+          - up
+          - down
+      imageTag:
+        description: 'Image tag to build/deploy (only used for "up")'
+        default: 'latest'
+        type: string
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # Reuses the GitHub OIDC provider that already exists in this AWS account for Mesh's own
+      # CI — scripts/aws/setup-fraud-detection-iam.ps1 creates a role trusting it, scoped to
+      # THIS repo's OIDC subject (Mesh's own role's trust policy is scoped to the Mesh repo and
+      # cannot be reused here). AWS_ROLE_ARN is a GitHub Environment variable on "dev" —
+      # per-environment scoping, matching Mesh's own deploy-aws-*.yml convention.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-2
+
+      # TODO: pin to a specific commit SHA once one has been verified — see the same TODO in
+      # demo-lifecycle.yml (Azure workflow) for why this is a version tag, not a SHA, for now.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install -r backend/requirements.txt
+
+      - name: Deploy
+        if: inputs.action == 'up'
+        shell: pwsh
+        run: |
+          ./scripts/deploy-fraud-detection-to-aws.ps1 `
+            -ImageTag '${{ inputs.imageTag }}' `
+            -MeshBaseUrl '${{ vars.FRAUD_DEMO_AWS_MESH_BASE_URL }}' `
+            -MongoConnectionString '${{ secrets.FRAUD_DEMO_AWS_MESH_MONGO_CONNECTION_STRING }}'
+
+      - name: Teardown
+        if: inputs.action == 'down'
+        shell: pwsh
+        run: |
+          ./scripts/teardown-fraud-detection-aws.ps1 `
+            -MeshBaseUrl '${{ vars.FRAUD_DEMO_AWS_MESH_BASE_URL }}' `
+            -MongoConnectionString '${{ secrets.FRAUD_DEMO_AWS_MESH_MONGO_CONNECTION_STRING }}'

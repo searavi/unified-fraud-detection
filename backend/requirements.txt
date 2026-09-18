@@ -12,4 +12,6 @@ apscheduler==3.10.4
 aerospike>=15.0.0
 sse-starlette>=1.6.5
 faker>=30.0.0
-docker>=7.0.0
+pymongo>=4.6.0
+msal>=1.28.0
+itsdangerous>=2.1.2
