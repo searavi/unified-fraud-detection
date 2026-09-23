@@ -164,8 +164,19 @@ export interface InvestigationState {
 }
 
 export interface PolicyActionState {
-  status: "idle" | "enabling" | "failed";
+  status: "idle" | "enabling" | "propagating" | "failed";
   message?: string;
+}
+
+// enable-workflow-policy PUTs + verifies the policy against Mesh's own store (fast — no OPA
+// wait). OPA's bundle poll can still lag behind that by its own real interval, so rather than
+// blocking here for the worst case, startInvestigation's execute call retries on that specific
+// error server-side. This is just a short, fixed pause so the UI doesn't flash instantly from
+// "enabling" straight to a running investigation.
+const POLICY_ENABLED_DISPLAY_MS = 5000;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 const initialState: InvestigationState = {
@@ -469,9 +480,12 @@ export function useInvestigation() {
     [cleanup]
   );
 
-  // Push a HITL policy authorizing this workflow + its agents, wait for OPA to pick it up, and
-  // re-trigger the investigation once verified. Used by the "Enable Workflow Execution" button
-  // shown when Mesh blocks a run with errorCode "hitl_policy_missing".
+  // Push a HITL policy authorizing this workflow + its agents and verify it against Mesh's own
+  // store (both fast — no OPA wait), show a short fixed pause, then kick off the investigation.
+  // OPA's bundle poll can still lag behind the PUT by its own real interval; rather than blocking
+  // this click on that worst case, startInvestigation's execute call retries server-side on a
+  // policy-not-yet-propagated error. Used by the "Enable Workflow Execution" button shown when
+  // Mesh blocks a run with errorCode "hitl_policy_missing".
   const enableWorkflowPolicy = useCallback(
     async (userId: string) => {
       setPolicyAction({ status: "enabling" });
@@ -481,7 +495,7 @@ export function useInvestigation() {
         });
         const data = await response.json().catch(() => ({}));
 
-        if (!response.ok || !data.success || !data.verified) {
+        if (!response.ok || !data.success) {
           setPolicyAction({
             status: "failed",
             message: data.message || data.detail || "Failed to enable workflow policy",
@@ -489,8 +503,10 @@ export function useInvestigation() {
           return;
         }
 
+        setPolicyAction({ status: "propagating", message: "Waiting for policy updates to take effect..." });
+        await delay(POLICY_ENABLED_DISPLAY_MS);
+
         setPolicyAction({ status: "idle" });
-        // Policy is confirmed active — clear the old error and retry the investigation.
         await startInvestigation(userId);
       } catch (error) {
         setPolicyAction({

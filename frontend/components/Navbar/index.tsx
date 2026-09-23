@@ -1,18 +1,22 @@
 'use client'
 
+import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import Toggle from './Toggle'
-import { usePathname } from 'next/navigation'
-import { Activity } from 'lucide-react'
+import { Activity, LogIn } from 'lucide-react'
 import { ThemeProvider } from 'next-themes'
-import clsx from 'clsx'
-
-const navigation = [
-  { name: 'Flagged Accounts', href: '/flagged' },
-]
+import { Button } from '@/components/ui/button'
 
 export default function Navbar() {
-  	const pathname = usePathname()
+	const [showLogin, setShowLogin] = useState(false)
+
+	useEffect(() => {
+		fetch('/auth/status')
+			.then((res) => (res.ok ? res.json() : null))
+			.then((data) => setShowLogin(Boolean(data?.login_available) && !data?.logged_in))
+			.catch(() => setShowLogin(false))
+	}, [])
+
   	return (
     	<ThemeProvider attribute='data-theme' enableSystem>
       		<nav className="border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
@@ -23,29 +27,21 @@ export default function Navbar() {
                 				<Activity className="h-6 w-6" />
                 				<span className="font-bold">Fraud Detection</span>
               				</Link>
-              				<div className="hidden md:flex space-x-4">
-							{navigation.map((item) => (
-								<Link
-									key={item.name}
-									href={item.href}
-									className={clsx(
-										'px-3 py-2 rounded-md text-sm font-medium transition-colors', 
-										pathname.startsWith(item.href) ? 
-											'bg-primary text-primary-foreground'
-											: 'text-muted-foreground hover:text-foreground hover:bg-accent'
-									)}
-								>
-									{item.name}
-								</Link>
-							))}
-							</div>
  			           	</div>
             			<div className="flex items-center space-x-2">
                 			<Toggle />
+							{showLogin && (
+								<Button asChild size="sm">
+									<a href="/auth/login">
+										<LogIn className="h-4 w-4 mr-2" />
+										Login
+									</a>
+								</Button>
+							)}
             			</div>
           			</div>
         		</div>
       		</nav>
     	</ThemeProvider>
   	)
-} 
+}

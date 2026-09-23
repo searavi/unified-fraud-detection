@@ -61,11 +61,33 @@
 .PARAMETER AssertionAlgorithm
     Default: RS256.
 
+.PARAMETER MongoDatabaseName
+    Default: fraud_detection_demo. MUST match deploy-fraud-detection-to-aws.ps1's
+    -MongoDatabaseName exactly — agents and backend share one Mongo server but pick their
+    database by this name, not by the connection string's path segment.
+
+.PARAMETER LlmProvider
+    Default: gemini (matches Agent-mongo-fraud-agents/docker-compose.split.yml's local E2E setup).
+    llm_agent.py / report_generation.py default to "ollama" when LLM_PROVIDER is unset, which has
+    no reachable daemon inside an ECS task — set to "ollama" only if a reachable Ollama endpoint
+    is configured separately.
+
+.PARAMETER GeminiApiKey
+    Required when -LlmProvider is "gemini". Defaults to $env:GEMINI_API_KEY — never hardcode this,
+    never pass it where it would be logged.
+
+.PARAMETER GeminiModel
+    Default: gemini-3.5-flash-lite (matches the model actually configured on the running local
+    agent container — docker-compose.split.yml's own fallback value, gemini-2.0-flash, and
+    llm_agent.py/report_generation.py's fallback, gemini-1.5-flash, are both stale and do not
+    reflect what's actually deployed locally).
+
 .EXAMPLE
     ./register-fraud-agents-aws.ps1 -MeshBaseUrl "https://mesh.example.com" `
         -MeshAdminToken $env:MESH_ADMIN_TOKEN `
         -AgentPackagesDir "../Agent-mongo-fraud-agents/dist/agent-packages" `
-        -AgentKeyVaultSigningKeyUri "arn:aws:kms:us-east-2:297784246949:key/..."
+        -AgentKeyVaultSigningKeyUri "arn:aws:kms:us-east-2:297784246949:key/..." `
+        -GeminiApiKey $env:GEMINI_API_KEY
 #>
 
 [CmdletBinding()]
@@ -86,8 +108,38 @@ param(
     [Parameter(Mandatory = $true, HelpMessage = "REQUIRED. AWS KMS key ARN (or equivalent) used to verify agent assertions.")]
     [string]$AgentKeyVaultSigningKeyUri,
 
-    [string]$AssertionAlgorithm = "RS256"
+    [string]$AssertionAlgorithm = "RS256",
+
+    # Must match deploy-fraud-detection-to-aws.ps1's -MongoDatabaseName (default fraud_detection_demo)
+    # exactly. Agent-mongo-fraud-agents/aerospike_client/mongo_service.py defaults MONGODB_DATABASE
+    # to "fraud_detection" when unset — a real live mismatch confirmed against the deployed
+    # backend's own MONGODB_DATABASE=fraud_detection_demo env var: without this, agents write
+    # investigation state (fraud_investigations collection) into a different database than the
+    # backend reads from, so the pipeline reports success but the report never reaches the
+    # frontend. ConnectionStrings__MongoDB alone is not enough — the database name segment in
+    # that URI is overridden by MongoClient[MONGODB_DATABASE], not read from the URI path.
+    [string]$MongoDatabaseName = "fraud_detection_demo",
+
+    # Mesh's ContainerRuntime:Port config (appsettings.json, shared across every provider) is
+    # 9090 -- confirmed live, not this project's own convention. EcsFargateContainerOrchestrator
+    # maps the ECS container port to this value but never tells the AGENT what port to actually
+    # listen on; this app's own SERVICE_PORT env var (default 8000, Python service/config.py)
+    # must be set to match or the container comes up healthy on the wrong port and Mesh's
+    # readiness probe never succeeds -- deploymentStatus sticks at Provisioning forever.
+    [string]$AgentServicePort = "9090",
+
+    # Matches docker-compose.split.yml's local Gemini E2E setup (Agent-mongo-fraud-agents repo) —
+    # llm_agent.py / report_generation.py read LLM_PROVIDER (default "ollama" if unset), which is
+    # unreachable from inside an ECS task with no local Ollama daemon. Default here to "gemini" so
+    # cloud agents match the already-working local setup instead of falling back to Ollama.
+    [string]$LlmProvider = "gemini",
+    [string]$GeminiApiKey = $env:GEMINI_API_KEY,
+    [string]$GeminiModel = "gemini-3.5-flash-lite"
 )
+
+if ($LlmProvider -eq "gemini" -and -not $GeminiApiKey) {
+    throw "GeminiApiKey is required when LlmProvider is 'gemini' — pass -GeminiApiKey or set `$env:GEMINI_API_KEY."
+}
 
 $ErrorActionPreference = "Stop"
 
@@ -164,6 +216,14 @@ try {
             if ($LASTEXITCODE -ne 0) { throw "Failed to extract runtime-config.json from $($agent.Id).tar" }
         }
         $runtimeConfig = Get-Content (Join-Path $bundleDir "runtime-config.json") -Raw | ConvertFrom-Json
+        # SERVICE_PORT must match Mesh's own ContainerRuntime:Port (9090) — see -AgentServicePort.
+        $runtimeConfig | Add-Member -NotePropertyName SERVICE_PORT -NotePropertyValue $AgentServicePort -Force
+        $runtimeConfig | Add-Member -NotePropertyName MONGODB_DATABASE -NotePropertyValue $MongoDatabaseName -Force
+        $runtimeConfig | Add-Member -NotePropertyName LLM_PROVIDER -NotePropertyValue $LlmProvider -Force
+        if ($LlmProvider -eq "gemini") {
+            $runtimeConfig | Add-Member -NotePropertyName GEMINI_API_KEY -NotePropertyValue $GeminiApiKey -Force
+            $runtimeConfig | Add-Member -NotePropertyName GEMINI_MODEL -NotePropertyValue $GeminiModel -Force
+        }
 
         $body = @{
             Id = $agent.Id
@@ -183,12 +243,20 @@ try {
 
         try {
             Invoke-RestMethod -Uri "$MeshBaseUrl/api/v1/admin/agents" -Method Post -Headers $headers -Body $body | Out-Null
+            Write-Host "Registered (new) — deployment queued asynchronously." -ForegroundColor Green
         } catch {
-            $responseBody = $null
-            if ($_.ErrorDetails) { $responseBody = $_.ErrorDetails.Message }
-            throw "Failed to register '$($agent.Id)': $($_.Exception.Message)$(if ($responseBody) { " — $responseBody" })"
+            $statusCode = $_.Exception.Response.StatusCode.value__
+            if ($statusCode -eq 409) {
+                # Already registered (e.g. re-running this script to push a config change like
+                # LLM_PROVIDER) — AdminController's POST is create-only; PUT is its update path.
+                Invoke-RestMethod -Uri "$MeshBaseUrl/api/v1/admin/agents/$($agent.Id)" -Method Put -Headers $headers -Body $body | Out-Null
+                Write-Host "Already registered — updated existing registration instead." -ForegroundColor Green
+            } else {
+                $responseBody = $null
+                if ($_.ErrorDetails) { $responseBody = $_.ErrorDetails.Message }
+                throw "Failed to register '$($agent.Id)': $($_.Exception.Message)$(if ($responseBody) { " — $responseBody" })"
+            }
         }
-        Write-Host "Registration submitted — deployment queued asynchronously." -ForegroundColor Green
     }
 } finally {
     Remove-Item -Path $WorkDir -Recurse -Force -ErrorAction SilentlyContinue

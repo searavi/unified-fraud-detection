@@ -87,4 +87,8 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+*.tsbuildinfo
+
+# Local backups written by scripts (e.g. setup-pretoken-roles-lambda.ps1 -Rollback source)
+scripts/aws/*-backup.json
 *.bak

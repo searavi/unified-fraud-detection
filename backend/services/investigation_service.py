@@ -7,6 +7,7 @@ Provides SSE streaming for real-time investigation progress.
 
 import asyncio
 import os
+import time
 import uuid
 import logging
 from datetime import datetime
@@ -75,13 +76,21 @@ MESH_HITL_ERROR_LABELS = {
     "MESH_HITL_APPROVAL_REQUIRED": "Awaiting human approval",
 }
 
-# Mesh and OPA share a network namespace (test-container-locally.ps1): OPA polls Mesh's
-# internal/hitl/opa-bundle endpoint every 1-2s and serves whatever's in Mesh's own IPolicyStore
-# for this tenant. PUT /api/v1/hitl/policies/{tenantId} is therefore a real, near-instant policy
-# update — no file write, no container restart.
+# Mesh and OPA share a network namespace and OPA polls Mesh's internal/hitl/opa-bundle endpoint
+# for whatever's in Mesh's own IPolicyStore for this tenant — no file write, no container
+# restart.
 HITL_TENANT_ID = os.environ.get("HITL_TENANT_ID", "default")
-# Comfortably above OPA's max_delay_seconds=2 polling interval.
-POLICY_PROPAGATION_WAIT_SECONDS = 3
+
+# Mesh's own IPolicyStore updates instantly on PUT, but OPA's cached bundle can lag behind by up
+# to its real poll interval (1-2s locally, 30-60s on both cloud deployments — see
+# deploy-meshruntime-to-aws.ps1 / deploy-meshruntime-sidecars-to-azure.ps1's
+# bundles.authz.polling.min/max_delay_seconds). Rather than blocking the "Enable Workflow
+# Execution" click on that worst case up front, stream_investigation retries the actual execute
+# call for up to this long on a policy-not-yet-propagated error — most runs succeed well before
+# the ceiling. Each deploy script sets this to match its own OPA config.
+EXECUTE_POLICY_RETRY_MAX_SECONDS = int(os.environ.get("OPA_BUNDLE_MAX_DELAY_SECONDS", "60"))
+EXECUTE_POLICY_RETRY_INTERVAL_SECONDS = 5
+RETRYABLE_HITL_ERROR_CODES = {"hitl_policy_missing", "hitl_policy_denied"}
 
 # Roles carried by the /local/token admin token (TokenService.CreateMeshTokenAsync adds both
 # when MeshUser.IsAdmin is true) — authz.rego's Gate 3 (execute_workflow) checks
@@ -109,6 +118,9 @@ class InvestigationService:
         self._mesh_client = httpx.AsyncClient(timeout=300.0)
         self._active_investigations: Dict[str, Dict[str, Any]] = {}
         self._investigation_results: Dict[str, Dict[str, Any]] = {}
+        # Set by trigger_workflow_policy_update, read by stream_investigation to decide whether a
+        # HITL policy failure is worth retrying — see EXECUTE_POLICY_RETRY_MAX_SECONDS.
+        self._policy_updated_at: Optional[float] = None
         logger.info(f"Investigation service initialized — Mesh at {self._mesh_base_url}")
 
     async def _mesh_auth_header(self, mesh_token: Optional[str] = None) -> Dict[str, str]:
@@ -133,18 +145,25 @@ class InvestigationService:
         token = response.json()["token"]
         return {"Authorization": f"Bearer {token}"}
 
-    async def initialize(self):
-        """Register workflow manifest with Mesh and store the workflow ID."""
+    async def initialize(self, mesh_token: Optional[str] = None):
+        """Register workflow manifest with Mesh and store the workflow ID.
+
+        mesh_token: the logged-in caller's real token, used as-is if provided; falls back to
+        the local-dev /local/token shortcut otherwise. WorkflowController has no [Authorize] of
+        its own, but Mesh's global FallbackPolicy still requires ANY authenticated caller — so
+        in Production (/local/token disabled) this call fails unless a real token is threaded
+        through from whichever route triggered initialization.
+        """
         try:
-            self._mesh_workflow_id = await self._create_mesh_workflow()
+            self._mesh_workflow_id = await self._create_mesh_workflow(mesh_token)
             logger.info(f"Mesh workflow registered: {self._mesh_workflow_id}")
         except Exception as e:
             logger.error(f"Failed to initialize investigation service: {e}")
             raise
 
-    async def _create_mesh_workflow(self) -> str:
+    async def _create_mesh_workflow(self, mesh_token: Optional[str] = None) -> str:
         """POST AgentManifest to Mesh and return the workflowId."""
-        headers = await self._mesh_auth_header()
+        headers = await self._mesh_auth_header(mesh_token)
         response = await self._mesh_client.post(
             f"{self._mesh_base_url}/api/workflow/create",
             json=WORKFLOW_MANIFEST,
@@ -239,31 +258,36 @@ class InvestigationService:
         merged["agent_approvals"] = agent_approvals
         return merged
 
-    async def enable_workflow_policy_and_wait(self, mesh_token: Optional[str] = None) -> Dict[str, Any]:
+    async def trigger_workflow_policy_update(self, mesh_token: Optional[str] = None) -> Dict[str, Any]:
         """GET the tenant's current HITL policy, merge in an allow for exactly this workflow and
-        its own agents, PUT the merged document back, and wait for OPA's next bundle poll to pick
-        it up. No file write, no container restart — Mesh and OPA share a network namespace and
-        OPA polls Mesh's internal/hitl/opa-bundle endpoint every 1-2s.
+        its own agents, PUT the merged document back, then GET it again to confirm Mesh's own
+        IPolicyStore actually reflects the write (catches a genuine PUT failure). Does NOT wait
+        for OPA's bundle poll to pick the change up — Mesh's store is consistent the instant the
+        PUT lands, but OPA (the actual policy enforcement engine) can lag behind by its own real
+        poll interval (see EXECUTE_POLICY_RETRY_MAX_SECONDS). Rather than blocking this call on
+        that worst case, stream_investigation retries the actual execute attempt on a
+        policy-not-yet-propagated error instead — most runs succeed well before the ceiling, so
+        the "Enable Workflow Execution" click itself stays fast.
 
         mesh_token: the logged-in caller's real token (see main.py's session handling), used
         as-is if provided; falls back to the local-dev /local/token shortcut otherwise.
 
-        Returns {"success": bool, "verified": bool, "message": str}.
+        Returns {"success": bool, "message": str}.
         """
         if not self._mesh_workflow_id:
-            await self.initialize()
+            await self.initialize(mesh_token)
 
         try:
             headers = await self._mesh_auth_header(mesh_token)
         except httpx.HTTPError as e:
             logger.error(f"Failed to fetch Mesh admin token: {e}")
-            return {"success": False, "verified": False, "message": f"Failed to authenticate to Mesh: {e}"}
+            return {"success": False, "message": f"Failed to authenticate to Mesh: {e}"}
 
         try:
             current = await self._mesh_get_policy(headers)
         except httpx.HTTPError as e:
             logger.error(f"Failed to fetch current Mesh policy: {e}")
-            return {"success": False, "verified": False, "message": f"Failed to fetch current Mesh policy: {e}"}
+            return {"success": False, "message": f"Failed to fetch current Mesh policy: {e}"}
 
         merged = self._merge_allow_into(current)
         try:
@@ -277,53 +301,51 @@ class InvestigationService:
             logger.error(f"Mesh rejected policy update: {e.response.status_code} {e.response.text}")
             return {
                 "success": False,
-                "verified": False,
                 "message": f"Mesh rejected policy update ({e.response.status_code}): {e.response.text}",
             }
         except httpx.HTTPError as e:
             logger.error(f"Failed to reach Mesh policy API: {e}")
-            return {"success": False, "verified": False, "message": f"Failed to reach Mesh: {e}"}
+            return {"success": False, "message": f"Failed to reach Mesh: {e}"}
 
-        logger.info(
-            f"Policy for tenant '{HITL_TENANT_ID}' merged to allow workflow '{self._mesh_workflow_id}' "
-            f"and its agents — waiting {POLICY_PROPAGATION_WAIT_SECONDS}s for OPA's next bundle poll"
-        )
-        await asyncio.sleep(POLICY_PROPAGATION_WAIT_SECONDS)
-
-        agent_ids = [task["agentId"] for task in WORKFLOW_MANIFEST["manifest"]["tasks"]]
+        # Confirm Mesh's own IPolicyStore actually reflects the write — catches a genuine PUT
+        # failure (e.g. a field silently dropped). This says nothing about OPA's bundle-poll
+        # freshness; see EXECUTE_POLICY_RETRY_MAX_SECONDS for that.
         try:
             fetched = await self._mesh_get_policy(headers)
-            fetched_workflow_approvals = fetched.get("workflow_approvals", {})
-            fetched_agent_approvals = fetched.get("agent_approvals", {})
-            verified = (
-                self._mesh_workflow_id in fetched.get("workflow_policies", [])
-                and set(agent_ids) <= set(fetched.get("agent_policies", []))
-                and set(EXECUTOR_ROLES) & set(fetched.get("executor_roles", []))
-                and fetched_workflow_approvals.get(self._mesh_workflow_id, {}).get("approved") is True
-                and all(
-                    fetched_agent_approvals.get(agent_id, {}).get("approved") is True
-                    for agent_id in agent_ids
-                )
-            )
         except httpx.HTTPError as e:
-            logger.error(f"Failed to verify policy update: {e}")
+            logger.error(f"Policy PUT succeeded but the verify GET failed: {e}")
+            return {"success": False, "message": f"Policy update sent but could not be verified: {e}"}
+
+        agent_ids = [task["agentId"] for task in WORKFLOW_MANIFEST["manifest"]["tasks"]]
+        fetched_workflow_approvals = fetched.get("workflow_approvals", {})
+        fetched_agent_approvals = fetched.get("agent_approvals", {})
+        verified = (
+            self._mesh_workflow_id in fetched.get("workflow_policies", [])
+            and set(agent_ids) <= set(fetched.get("agent_policies", []))
+            and set(EXECUTOR_ROLES) & set(fetched.get("executor_roles", []))
+            and fetched_workflow_approvals.get(self._mesh_workflow_id, {}).get("approved") is True
+            and all(
+                fetched_agent_approvals.get(agent_id, {}).get("approved") is True
+                for agent_id in agent_ids
+            )
+        )
+        if not verified:
+            logger.error(
+                f"Policy PUT for tenant '{HITL_TENANT_ID}' succeeded but the verify GET doesn't "
+                f"show the expected allow for workflow '{self._mesh_workflow_id}'"
+            )
             return {
-                "success": True,
-                "verified": False,
-                "message": f"Policy PUT succeeded but could not verify it stuck: {e}",
+                "success": False,
+                "message": "Policy update did not persist as expected — check Mesh logs.",
             }
 
-        if verified:
-            return {
-                "success": True,
-                "verified": True,
-                "message": f"Workflow '{self._mesh_workflow_id}' and its agents are now allowed to execute.",
-            }
-        return {
-            "success": True,
-            "verified": False,
-            "message": "Policy PUT succeeded but Mesh does not report the expected scoped policy on read-back.",
-        }
+        self._policy_updated_at = time.monotonic()
+        logger.info(
+            f"Policy for tenant '{HITL_TENANT_ID}' merged to allow workflow '{self._mesh_workflow_id}' "
+            f"and its agents — PUT verified. OPA may still take a moment to pick it up; the actual "
+            f"execute call retries on that."
+        )
+        return {"success": True, "message": "Policy update submitted and verified."}
 
     async def close(self):
         """Clean up resources."""
@@ -359,7 +381,7 @@ class InvestigationService:
             investigation_id = await self.start_investigation(user_id)
 
         if not self._mesh_workflow_id:
-            await self.initialize()
+            await self.initialize(mesh_token)
 
         # SSE start event
         yield {
@@ -378,40 +400,81 @@ class InvestigationService:
                 self.aerospike_service.put_investigation(investigation_id, dict(initial_state))
                 logger.info(f"Initial state written for {investigation_id}")
 
-            # Launch Mesh workflow execution as background task
+            # Launch Mesh workflow execution, retrying on a policy-not-yet-propagated error — OPA's
+            # bundle poll can lag behind trigger_workflow_policy_update's PUT by its own real
+            # interval (EXECUTE_POLICY_RETRY_MAX_SECONDS). Retrying the execute attempt itself,
+            # rather than blocking "Enable Workflow Execution" on the worst case up front, means
+            # most runs proceed immediately and only a genuinely slow propagation waits at all.
+            #
+            # Retrying is only worth it if a policy update was actually pushed recently — if
+            # trigger_workflow_policy_update was never called (or was too long ago to plausibly
+            # still be propagating), a HITL failure here means no policy exists at all, and no
+            # amount of retrying fixes that. Fail on the first attempt in that case so "Enable
+            # Workflow Execution" surfaces immediately instead of after a pointless 60s wait —
+            # confirmed live: retrying blindly here burned the full 60s before ever showing the
+            # recovery button on a fresh investigation that had never been enabled.
             mesh_headers = await self._mesh_auth_header(mesh_token)
-            execute_task = asyncio.create_task(
-                self._mesh_client.post(
-                    f"{self._mesh_base_url}/api/workflow/{self._mesh_workflow_id}/execute",
-                    json={
-                        "goal": "investigate",
-                        "inputs": {
-                            "investigation_id": investigation_id,
-                            "user_id": user_id,
-                        },
-                    },
-                    headers=mesh_headers,
-                )
+            retry_deadline = (
+                self._policy_updated_at + EXECUTE_POLICY_RETRY_MAX_SECONDS
+                if self._policy_updated_at is not None
+                else None
             )
+            while True:
+                execute_task = asyncio.create_task(
+                    self._mesh_client.post(
+                        f"{self._mesh_base_url}/api/workflow/{self._mesh_workflow_id}/execute",
+                        json={
+                            "goal": "investigate",
+                            "inputs": {
+                                "investigation_id": investigation_id,
+                                "user_id": user_id,
+                            },
+                        },
+                        headers=mesh_headers,
+                    )
+                )
 
-            # POST {workflowId}/execute blocks until the workflow finishes (or pauses on HITL),
-            # so there's no run id to poll status against while it's in flight — Mesh only
-            # returns WorkflowExecutionId in the response body once execute_task completes.
-            # Just wait for it; remaining progress steps are emitted below in one burst.
+                # POST {workflowId}/execute blocks until the workflow finishes (or pauses on
+                # HITL), so there's no run id to poll status against while it's in flight — Mesh
+                # only returns WorkflowExecutionId in the response body once execute_task
+                # completes. Just wait for it; remaining progress steps are emitted below.
+                while not execute_task.done():
+                    await asyncio.sleep(2)
+
+                mesh_resp = execute_task.result()
+                mesh_resp.raise_for_status()
+                mesh_body = mesh_resp.json()
+                mesh_status = mesh_body.get("status")
+
+                if mesh_status == "Completed":
+                    break
+
+                error_code = mesh_body.get("errorCode")
+                if (
+                    error_code in RETRYABLE_HITL_ERROR_CODES
+                    and retry_deadline is not None
+                    and time.monotonic() < retry_deadline
+                ):
+                    remaining = round(retry_deadline - time.monotonic())
+                    # No user-facing event here on purpose — this stays behind the scenes so
+                    # "Start AI Investigation" just looks like it's starting up, not stuck on a
+                    # policy wait. The frontend's existing pre-first-step loading state covers it.
+                    logger.info(
+                        f"Investigation {investigation_id}: policy not yet propagated "
+                        f"(errorCode={error_code}), retrying in "
+                        f"{EXECUTE_POLICY_RETRY_INTERVAL_SECONDS}s (~{remaining}s left before giving up)"
+                    )
+                    await asyncio.sleep(EXECUTE_POLICY_RETRY_INTERVAL_SECONDS)
+                    continue
+
+                break  # not retryable, or retries exhausted — fall through to error handling below
+
             emitted_steps = 0
-            while not execute_task.done():
-                await asyncio.sleep(2)
-
-            # Collect Mesh response
-            mesh_resp = execute_task.result()
-            mesh_resp.raise_for_status()
-            mesh_body = mesh_resp.json()
 
             # Mesh reports HITL/policy outcomes in the body, not the HTTP status — a 200 can carry
             # status="Failed" (errorCode "hitl_policy_missing"/"hitl_policy_denied") or
             # "AwaitingApproval" (errorCode "MESH_HITL_APPROVAL_REQUIRED", Gate 4/5 paused for a
             # human). Only "Completed" means the agents actually ran.
-            mesh_status = mesh_body.get("status")
             if mesh_status != "Completed":
                 error_code = mesh_body.get("errorCode")
                 reason = mesh_body.get("error") or mesh_body.get("message") or "Unknown Mesh failure"

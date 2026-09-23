@@ -110,8 +110,12 @@ def clear_tagged_workflow_manifests(mongo_uri: str) -> list:
     return workflow_ids
 
 
-def scrub_hitl_policy(mesh_base_url: str, tenant_id: str, workflow_ids: list) -> None:
-    token = _mesh_token(mesh_base_url)
+def scrub_hitl_policy(mesh_base_url: str, tenant_id: str, workflow_ids: list, mesh_admin_token: str = None) -> None:
+    # /api/v1/mesh/security/local/token is Production-disabled — _mesh_token only works against
+    # a dev-mode Mesh. Any real deployment (ASPNETCORE_ENVIRONMENT=Production) must supply a real
+    # admin-role token via --mesh-admin-token instead (HitlPoliciesController requires
+    # [Authorize(Policy = "AdminPolicy")] on every route, no lesser role satisfies it).
+    token = mesh_admin_token or _mesh_token(mesh_base_url)
     current = _mesh_get_policy(mesh_base_url, tenant_id, token)
     if current is None:
         print(f"No policy document exists yet for tenant '{tenant_id}' — nothing to remove.")
@@ -129,11 +133,18 @@ def main():
     parser.add_argument("--mesh-base-url", required=True)
     parser.add_argument("--mesh-mongo-uri", required=True, help="Connection string for the shared Mongo instance Mesh's operational store uses.")
     parser.add_argument("--tenant-id", default="default")
+    parser.add_argument(
+        "--mesh-admin-token",
+        default=None,
+        help="Real admin-role bearer token (required against a Production Mesh deployment, "
+             "where /local/token is disabled). Falls back to /local/token when omitted, for "
+             "local dev use only.",
+    )
     args = parser.parse_args()
 
     workflow_ids = clear_tagged_workflow_manifests(args.mesh_mongo_uri)
     try:
-        scrub_hitl_policy(args.mesh_base_url, args.tenant_id, workflow_ids)
+        scrub_hitl_policy(args.mesh_base_url, args.tenant_id, workflow_ids, args.mesh_admin_token)
     except (urllib.error.URLError, RuntimeError) as e:
         print(f"WARNING: Failed to update HITL policy via Mesh ({args.mesh_base_url}): {e}", file=sys.stderr)
         sys.exit(1)

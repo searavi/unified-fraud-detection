@@ -8,11 +8,14 @@
     Creates a dedicated ECS cluster (fraud-detection-*, separate from Mesh's own cluster —
     zero cost difference under Fargate, cleaner isolation), builds+pushes both images to ECR,
     grants the task security group ingress to Mesh's Mongo EC2 instance's security group,
-    creates a NEW Cognito App Client in Mesh's EXISTING user pool (not reusing Mesh's own
-    client), runs both services behind one ALB (plain HTTP — no ACM/Route53 domain configured;
-    same fallback Mesh's own AWS deploy uses without -CustomDomain), seeds the shared Mongo
-    database, and resets this demo's HITL policy entries to blocking (tag-scoped — see
-    reset_hitl_policy.py; this Mesh deployment may be shared with other demos).
+    registers this demo's own callback URL on Mesh's EXISTING admin Cognito app client rather
+    than creating a separate client (Mesh's deployed Auth:IdPAudience trusts exactly one Cognito
+    audience — a client fraud-detection created itself would never pass Mesh's audience check;
+    see deploy script's own Cognito section and Get-MeshAdminToken's comment for the full
+    root-cause chain), runs both services behind one ALB (plain HTTP — no ACM/Route53 domain
+    configured; same fallback Mesh's own AWS deploy uses without -CustomDomain), seeds the
+    shared Mongo database, and resets this demo's HITL policy entries to blocking (tag-scoped —
+    see reset_hitl_policy.py; this Mesh deployment may be shared with other demos).
 
     Assumes the caller is already authenticated (`aws sts get-caller-identity` succeeds) with
     the permissions granted by scripts/aws/setup-fraud-detection-iam.ps1 (run that once first,
@@ -75,6 +78,17 @@ param(
     [string]$MongoDatabaseName = "fraud_detection_demo",
     [string]$CognitoUserPoolId = "us-east-2_D0FCCAyEB",
 
+    # Must match setup-fraud-detection-iam.ps1's defaults — that script provisions this account
+    # and its password once; this script only ever authenticates as it.
+    [string]$AutomationUsername = "fraud-detection-automation@synchtron-test.local",
+    [string]$AutomationSecretName = "fraud-detection/dev/automation-user-password",
+
+    # Mesh's OWN pre-existing Cognito admin app client (mesh-runtime-admins user pool) —
+    # confirmed live to be the one and only audience Mesh's deployed Auth:IdPAudience trusts.
+    # The HITL-scrub service account authenticates against THIS client, not this demo's own
+    # $cognitoClientId, or Mesh rejects the resulting token with 401 on audience mismatch.
+    [string]$MeshAdminClientId = "2fvmn3og01l444d57fbojla6k6",
+
     [switch]$SkipBuild
 )
 
@@ -90,7 +104,6 @@ $TaskRoleName = "role-fraud-detection-task-dev-useast2"
 $TaskSecurityGroupName = "fraud-detection-task-dev-useast2"
 $AlbSecurityGroupName = "fraud-detection-alb-dev-useast2"
 $AlbName = "fraud-detection-dev-useast2"
-$CognitoAppClientName = "fraud-detection-demo"
 
 $script:SecretValues = @($MongoConnectionString)
 
@@ -137,8 +150,8 @@ function Get-OrCreateSecurityGroup {
 }
 
 Write-Host "`n=== Ensuring security groups ===" -ForegroundColor Cyan
-$AlbSecurityGroupId = Get-OrCreateSecurityGroup -Name $AlbSecurityGroupName -Description "Fraud-detection demo ALB — inbound HTTP from internet"
-$TaskSecurityGroupId = Get-OrCreateSecurityGroup -Name $TaskSecurityGroupName -Description "Fraud-detection demo ECS tasks — inbound from ALB only"
+$AlbSecurityGroupId = Get-OrCreateSecurityGroup -Name $AlbSecurityGroupName -Description "Fraud-detection demo ALB - inbound HTTP from internet"
+$TaskSecurityGroupId = Get-OrCreateSecurityGroup -Name $TaskSecurityGroupName -Description "Fraud-detection demo ECS tasks - inbound from ALB only"
 
 # Idempotent: AuthorizeSecurityGroupIngress errors (InvalidPermission.Duplicate) if the rule
 # already exists — treated as success, everything else re-thrown.
@@ -150,9 +163,11 @@ function Grant-IngressIfMissing {
     }
 }
 
-$albIngressResult = & aws ec2 authorize-security-group-ingress --region $Region --group-id $AlbSecurityGroupId --protocol tcp --port 80 --cidr "0.0.0.0/0" 2>&1
-if ($LASTEXITCODE -ne 0 -and ($albIngressResult -join "`n") -notmatch "InvalidPermission\.Duplicate") {
-    throw "Failed to authorize public HTTP ingress on ALB security group: $albIngressResult"
+foreach ($albPort in 80, 8081) {
+    $albIngressResult = & aws ec2 authorize-security-group-ingress --region $Region --group-id $AlbSecurityGroupId --protocol tcp --port $albPort --cidr "0.0.0.0/0" 2>&1
+    if ($LASTEXITCODE -ne 0 -and ($albIngressResult -join "`n") -notmatch "InvalidPermission\.Duplicate") {
+        throw "Failed to authorize public HTTP ingress on port ${albPort} for ALB security group: $albIngressResult"
+    }
 }
 Grant-IngressIfMissing -GroupId $TaskSecurityGroupId -Protocol "tcp" -Port 4000 -SourceGroupId $AlbSecurityGroupId
 Grant-IngressIfMissing -GroupId $TaskSecurityGroupId -Protocol "tcp" -Port 8080 -SourceGroupId $AlbSecurityGroupId
@@ -190,10 +205,245 @@ Write-Host "`n=== Ensuring ECS execution/task roles ===" -ForegroundColor Cyan
 $ExecutionRoleArn = Get-OrCreateEcsRole -RoleName $ExecutionRoleName -ManagedPolicyArn "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 $TaskRoleArn = Get-OrCreateEcsRole -RoleName $TaskRoleName -ManagedPolicyArn $null
 
+# AmazonECSTaskExecutionRolePolicy covers ECR pull + logs:CreateLogStream/PutLogEvents, but NOT
+# logs:CreateLogGroup (needed because the task defs below set awslogs-create-group=true) or
+# secretsmanager:GetSecretValue on this demo's own secrets (any task def field referencing a
+# fraud-detection/* secret ARN needs this at container start to resolve it). Idempotent — always
+# (re-)put, not just on first creation, so a role created before this policy existed still gets it.
+$executionRoleExtraPolicy = @{
+    Version   = "2012-10-17"
+    Statement = @(
+        @{
+            Sid      = "CreateOwnLogGroups"
+            Effect   = "Allow"
+            Action   = "logs:CreateLogGroup"
+            Resource = "arn:aws:logs:${Region}:${AccountId}:log-group:/ecs/fraud-detection-*"
+        }
+        @{
+            Sid      = "ReadOwnSecrets"
+            Effect   = "Allow"
+            Action   = "secretsmanager:GetSecretValue"
+            Resource = "arn:aws:secretsmanager:${Region}:${AccountId}:secret:fraud-detection/*"
+        }
+    )
+} | ConvertTo-Json -Depth 10
+$tmpExecPolicy = New-TemporaryFile
+Set-Content -Path $tmpExecPolicy -Value $executionRoleExtraPolicy -NoNewline
+try {
+    Invoke-Aws -Arguments @("iam","put-role-policy","--role-name",$ExecutionRoleName,"--policy-name","fraud-detection-execution-extras","--policy-document","file://$tmpExecPolicy") -ErrorContext "put-role-policy (execution role extras)" | Out-Null
+} finally {
+    Remove-Item $tmpExecPolicy -ErrorAction SilentlyContinue
+}
+
+# Image build moved to AFTER CloudFront/URL setup below (see that section for why: `next build`
+# bakes BACKEND_URL/NEXT_PUBLIC_BACKEND_URL in as build args, so the final URL must be known
+# before the frontend image builds — a real ordering dependency the multi-stage Dockerfile fix
+# introduced, not present in the old single-stage image where build and start shared one live
+# container environment).
+$ecrHost = "$AccountId.dkr.ecr.$Region.amazonaws.com"
+
+Write-Host "`n=== Ensuring ECS cluster ===" -ForegroundColor Cyan
+# describe-clusters exits 0 even when --clusters names a cluster that doesn't exist (it just
+# returns an empty "clusters" array, no error) — existence must be checked from the array
+# content, not $LASTEXITCODE.
+$activeClusters = (aws ecs describe-clusters --region $Region --clusters $ClusterName --query "clusters[?status=='ACTIVE']" --output json 2>$null | ConvertFrom-Json)
+if (-not $activeClusters -or $activeClusters.Count -eq 0) {
+    Invoke-Aws -Arguments @("ecs","create-cluster","--region",$Region,"--cluster-name",$ClusterName) -ErrorContext "create-cluster" | Out-Null
+}
+
+Write-Host "`n=== Ensuring Application Load Balancer ===" -ForegroundColor Cyan
+$existingAlb = (& aws elbv2 describe-load-balancers --region $Region --names $AlbName 2>$null | ConvertFrom-Json)
+if ($existingAlb -and $existingAlb.LoadBalancers.Count -gt 0) {
+    $alb = $existingAlb.LoadBalancers[0]
+} else {
+    $albArgs = @("elbv2","create-load-balancer","--region",$Region,"--name",$AlbName,"--type","application","--scheme","internet-facing","--subnets") + $SubnetIds + @("--security-groups",$AlbSecurityGroupId)
+    $alb = (Invoke-Aws -Arguments $albArgs -ErrorContext "create-load-balancer" | ConvertFrom-Json).LoadBalancers[0]
+}
+$AlbArn = $alb.LoadBalancerArn
+$AlbDnsName = $alb.DNSName
+Write-Host "ALB: $AlbDnsName" -ForegroundColor Green
+
+function Get-OrCreateTargetGroup {
+    param([string]$Name, [int]$Port, [string]$HealthCheckPath)
+    $existing = (& aws elbv2 describe-target-groups --region $Region --names $Name 2>$null | ConvertFrom-Json)
+    if ($existing -and $existing.TargetGroups.Count -gt 0) {
+        $tg = $existing.TargetGroups[0]
+        if ($tg.HealthCheckPath -ne $HealthCheckPath) {
+            Write-Host "Target group '$Name' health check path drifted ('$($tg.HealthCheckPath)') — correcting to '$HealthCheckPath'." -ForegroundColor Yellow
+            Invoke-Aws -Arguments @("elbv2","modify-target-group","--region",$Region,"--target-group-arn",$tg.TargetGroupArn,"--health-check-path",$HealthCheckPath) -ErrorContext "modify-target-group ($Name)" | Out-Null
+        }
+        return $tg.TargetGroupArn
+    }
+    $created = Invoke-Aws -Arguments @(
+        "elbv2","create-target-group","--region",$Region,"--name",$Name,"--protocol","HTTP","--port",$Port,
+        "--vpc-id",$VpcId,"--target-type","ip","--health-check-path",$HealthCheckPath
+    ) -ErrorContext "create-target-group ($Name)" | ConvertFrom-Json
+    return $created.TargetGroups[0].TargetGroupArn
+}
+
+$BackendTargetGroupArn = Get-OrCreateTargetGroup -Name "fraud-detection-backend" -Port 4000 -HealthCheckPath "/health"
+# "/" 307-redirects to "/flagged" (app/page.tsx) — the target group's default Matcher only
+# accepts 200, so a health check against "/" fails forever and ECS churns tasks continuously,
+# each briefly serving real traffic before being killed. Confirmed live: container logs showed a
+# perfectly healthy Next.js startup while the target group reported every task unhealthy on
+# exactly this. Check the redirect's actual destination instead.
+$FrontendTargetGroupArn = Get-OrCreateTargetGroup -Name "fraud-detection-frontend" -Port 8080 -HealthCheckPath "/flagged"
+
+# One ALB, two listeners: :80 -> frontend (what the audience visits), :8081 -> backend
+# (OAuth callback + direct API access). Avoids the cost/time of a second ALB for a demo.
+function Get-OrCreateListener {
+    param([int]$Port, [string]$TargetGroupArn)
+    $existing = (& aws elbv2 describe-listeners --region $Region --load-balancer-arn $AlbArn 2>$null | ConvertFrom-Json)
+    $match = $existing.Listeners | Where-Object { $_.Port -eq $Port }
+    if ($match) { return }
+    Invoke-Aws -Arguments @(
+        "elbv2","create-listener","--region",$Region,"--load-balancer-arn",$AlbArn,"--protocol","HTTP","--port",$Port,
+        "--default-actions","Type=forward,TargetGroupArn=$TargetGroupArn"
+    ) -ErrorContext "create-listener ($Port)" | Out-Null
+}
+Get-OrCreateListener -Port 80 -TargetGroupArn $FrontendTargetGroupArn
+Get-OrCreateListener -Port 8081 -TargetGroupArn $BackendTargetGroupArn
+
+# --- CloudFront: the ALB is deliberately plain HTTP (no ACM/Route53 domain — see script header),
+# but Cognito's OAuth callback URL must be HTTPS (its only non-HTTPS exemption is
+# http://localhost, which doesn't apply to a real deployed URL). CloudFront's default
+# *.cloudfront.net domain gets a valid AWS-managed cert for free — no custom domain, no ACM DNS
+# validation. TLS terminates at CloudFront; it talks to the ALB over plain HTTP behind it
+# (OriginProtocolPolicy http-only). One distribution, two origins (same ALB, different ports —
+# matching the ALB's own two-listener split): the default behavior forwards to the frontend
+# (:80), and explicit path patterns for every backend-owned route forward to the backend
+# (:8081). Both behaviors disable caching entirely (Managed-CachingDisabled) — none of this
+# app's responses are static/cacheable, and a stale cache would be a confusing demo bug for
+# zero benefit at this traffic level — and use Managed-AllViewer so cookies, the OAuth
+# code/state query string, and SSE headers (Accept: text/event-stream) all reach the origin
+# unmodified.
+#
+# KNOWN LIMIT: CloudFront's custom-origin read timeout tops out at 60s without an AWS support
+# quota increase (default 30s; requesting up to 60s needs no ticket, beyond 60s does) — set to
+# the max here. investigation_service.py's stream_investigation blocks on Mesh's
+# POST {workflowId}/execute until the workflow finishes; if a real investigation run ever takes
+# longer than 60s end-to-end, CloudFront will return 504 before the backend responds. Fine for
+# this demo's workflow today — flagging so it isn't a silent surprise if the workflow grows.
+Write-Host "`n=== Ensuring CloudFront distribution (HTTPS for the Cognito OAuth callback) ===" -ForegroundColor Cyan
+$CloudFrontComment = $AlbName
+$existingDistributions = (& aws cloudfront list-distributions --region $Region 2>$null | ConvertFrom-Json).DistributionList.Items
+$existingDistribution = $existingDistributions | Where-Object { $_.Comment -eq $CloudFrontComment }
+if ($existingDistribution) {
+    $CloudFrontDomain = $existingDistribution.DomainName
+    Write-Host "Reusing existing CloudFront distribution: $CloudFrontDomain" -ForegroundColor Yellow
+
+    # ALB DNS names are NOT stable across delete+recreate, even with the same -AlbName tag —
+    # teardown-fraud-detection-aws.ps1 has no CloudFront-deletion step (a known gap), so a
+    # teardown+redeploy cycle reuses THIS distribution but gets a brand-new ALB underneath it.
+    # Without this, the distribution's Origins keep pointing at the deleted ALB's old DNS name
+    # forever, and every request 502s with "CloudFront wasn't able to resolve the origin domain
+    # name" — confirmed live. GetDistributionConfig/UpdateDistribution require resending the
+    # FULL config (same full-replace API shape as UpdateUserPool/UpdateUserPoolClient elsewhere
+    # in this script set) — fetch it, patch only the two origins' DomainName, put back everything
+    # else unchanged, using the ETag GetDistributionConfig returns as the required --if-match.
+    $distConfigResponse = Invoke-Aws -Arguments @("cloudfront","get-distribution-config","--id",$existingDistribution.Id) -ErrorContext "get-distribution-config ($($existingDistribution.Id))" | ConvertFrom-Json
+    $currentConfig = $distConfigResponse.DistributionConfig
+    $etag = $distConfigResponse.ETag
+    $staleOrigins = $currentConfig.Origins.Items | Where-Object { $_.DomainName -ne $AlbDnsName }
+    if ($staleOrigins) {
+        Write-Host "Distribution's origins point at a stale ALB DNS name — updating to '$AlbDnsName'..." -ForegroundColor Yellow
+        foreach ($origin in $currentConfig.Origins.Items) { $origin.DomainName = $AlbDnsName }
+        $updateConfigJson = $currentConfig | ConvertTo-Json -Depth 20
+        $tmpUpdateConfig = New-TemporaryFile
+        Set-Content -Path $tmpUpdateConfig -Value $updateConfigJson -NoNewline
+        try {
+            Invoke-Aws -Arguments @("cloudfront","update-distribution","--id",$existingDistribution.Id,"--distribution-config","file://$tmpUpdateConfig","--if-match",$etag) -ErrorContext "update-distribution ($($existingDistribution.Id))" | Out-Null
+        } finally {
+            Remove-Item $tmpUpdateConfig -ErrorAction SilentlyContinue
+        }
+        Write-Host "Origins updated. Allow a few minutes for the change to propagate to all edge locations." -ForegroundColor Yellow
+    } else {
+        Write-Host "Distribution's origins already point at the current ALB — no update needed." -ForegroundColor Green
+    }
+} else {
+    $cachingDisabledPolicyId = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"   # AWS Managed-CachingDisabled
+    $allViewerOriginRequestPolicyId = "216adef6-5c7f-47e4-b989-5492eafa07d3"   # AWS Managed-AllViewer
+    $backendPathPatterns = @("/auth/*", "/health", "/users/*", "/flagged-accounts", "/flagged-accounts/*", "/accounts/*", "/investigation/*")
+
+    function New-CacheBehavior {
+        param([string]$PathPattern, [string]$TargetOriginId)
+        @{
+            PathPattern          = $PathPattern
+            TargetOriginId       = $TargetOriginId
+            ViewerProtocolPolicy = "redirect-to-https"
+            CachePolicyId        = $cachingDisabledPolicyId
+            OriginRequestPolicyId = $allViewerOriginRequestPolicyId
+            AllowedMethods       = @{
+                Quantity = 7
+                Items    = @("GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE")
+                CachedMethods = @{ Quantity = 2; Items = @("GET", "HEAD") }
+            }
+            Compress             = $true
+        }
+    }
+
+    $distributionConfig = @{
+        CallerReference = "$AlbName-$(Get-Random)"
+        Comment         = $CloudFrontComment
+        Enabled         = $true
+        Origins         = @{
+            Quantity = 2
+            Items    = @(
+                @{
+                    Id                = "frontend-origin"
+                    DomainName        = $AlbDnsName
+                    CustomOriginConfig = @{
+                        HTTPPort             = 80
+                        HTTPSPort            = 443
+                        OriginProtocolPolicy = "http-only"
+                        OriginSslProtocols   = @{ Quantity = 1; Items = @("TLSv1.2") }
+                        OriginReadTimeout    = 30
+                        OriginKeepaliveTimeout = 5
+                    }
+                }
+                @{
+                    Id                = "backend-origin"
+                    DomainName        = $AlbDnsName
+                    CustomOriginConfig = @{
+                        HTTPPort             = 8081
+                        HTTPSPort            = 443
+                        OriginProtocolPolicy = "http-only"
+                        OriginSslProtocols   = @{ Quantity = 1; Items = @("TLSv1.2") }
+                        OriginReadTimeout    = 60
+                        OriginKeepaliveTimeout = 5
+                    }
+                }
+            )
+        }
+        DefaultCacheBehavior = (New-CacheBehavior -PathPattern $null -TargetOriginId "frontend-origin")
+        CacheBehaviors  = @{
+            Quantity = $backendPathPatterns.Count
+            Items    = @($backendPathPatterns | ForEach-Object { New-CacheBehavior -PathPattern $_ -TargetOriginId "backend-origin" })
+        }
+        PriceClass      = "PriceClass_100"
+    }
+    # DefaultCacheBehavior has no PathPattern field — strip the $null one New-CacheBehavior set.
+    $distributionConfig.DefaultCacheBehavior.Remove("PathPattern")
+
+    $distributionJson = $distributionConfig | ConvertTo-Json -Depth 20
+    $tmpDistConfig = New-TemporaryFile
+    Set-Content -Path $tmpDistConfig -Value $distributionJson -NoNewline
+    try {
+        $created = Invoke-Aws -Arguments @("cloudfront","create-distribution","--distribution-config","file://$tmpDistConfig") -ErrorContext "create-distribution" | ConvertFrom-Json
+    } finally {
+        Remove-Item $tmpDistConfig -ErrorAction SilentlyContinue
+    }
+    $CloudFrontDomain = $created.Distribution.DomainName
+    Write-Host "Created CloudFront distribution: $CloudFrontDomain" -ForegroundColor Green
+    Write-Host "NOTE: new distributions take ~15-20 minutes to fully deploy — expect errors hitting it until then." -ForegroundColor Yellow
+}
+
+$backendUrl = "https://$CloudFrontDomain"
+$frontendUrl = "https://$CloudFrontDomain"
+
 if (-not $SkipBuild) {
     Write-Host "`n=== Building + pushing images to ECR ===" -ForegroundColor Cyan
     $loginPassword = Invoke-Aws -Arguments @("ecr","get-login-password","--region",$Region) -ErrorContext "ecr get-login-password"
-    $ecrHost = "$AccountId.dkr.ecr.$Region.amazonaws.com"
     $loginPassword | docker login --username AWS --password-stdin $ecrHost
     if ($LASTEXITCODE -ne 0) { throw "docker login to ECR failed" }
 
@@ -211,7 +461,13 @@ if (-not $SkipBuild) {
         docker push "${ecrHost}/${BackendRepoName}:${ImageTag}"
         if ($LASTEXITCODE -ne 0) { throw "docker push (backend) failed" }
 
-        docker build -f frontend.Dockerfile -t "${ecrHost}/${FrontendRepoName}:${ImageTag}" .
+        # --build-arg: see frontend.Dockerfile's build-stage comment — `next build` bakes these
+        # into a static routes manifest + the client bundle; a runtime-only env var can't override
+        # them anymore once the image is built.
+        docker build -f frontend.Dockerfile `
+            --build-arg "BACKEND_URL=$backendUrl" `
+            --build-arg "NEXT_PUBLIC_BACKEND_URL=$backendUrl" `
+            -t "${ecrHost}/${FrontendRepoName}:${ImageTag}" .
         if ($LASTEXITCODE -ne 0) { throw "docker build (frontend) failed" }
         docker push "${ecrHost}/${FrontendRepoName}:${ImageTag}"
         if ($LASTEXITCODE -ne 0) { throw "docker push (frontend) failed" }
@@ -220,104 +476,77 @@ if (-not $SkipBuild) {
     }
 } else {
     Write-Host "`n=== Skipping image builds — reusing ${ImageTag} already in ECR ===" -ForegroundColor Yellow
-    $ecrHost = "$AccountId.dkr.ecr.$Region.amazonaws.com"
 }
-
-Write-Host "`n=== Ensuring ECS cluster ===" -ForegroundColor Cyan
-aws ecs describe-clusters --region $Region --clusters $ClusterName --query "clusters[?status=='ACTIVE']" 2>$null | Out-Null
-$clusterActive = ($LASTEXITCODE -eq 0)
-if (-not $clusterActive) {
-    Invoke-Aws -Arguments @("ecs","create-cluster","--region",$Region,"--cluster-name",$ClusterName) -ErrorContext "create-cluster" | Out-Null
-}
-
-Write-Host "`n=== Ensuring Application Load Balancer ===" -ForegroundColor Cyan
-$existingAlb = (& aws elbv2 describe-load-balancers --region $Region --names $AlbName 2>$null | ConvertFrom-Json)
-if ($existingAlb -and $existingAlb.LoadBalancers.Count -gt 0) {
-    $alb = $existingAlb.LoadBalancers[0]
-} else {
-    $alb = (Invoke-Aws -Arguments @("elbv2","create-load-balancer","--region",$Region,"--name",$AlbName,"--type","application","--scheme","internet-facing","--subnets") + $SubnetIds + @("--security-groups",$AlbSecurityGroupId) -ErrorContext "create-load-balancer" | ConvertFrom-Json).LoadBalancers[0]
-}
-$AlbArn = $alb.LoadBalancerArn
-$AlbDnsName = $alb.DNSName
-Write-Host "ALB: $AlbDnsName" -ForegroundColor Green
-
-function Get-OrCreateTargetGroup {
-    param([string]$Name, [int]$Port, [string]$HealthCheckPath)
-    $existing = (& aws elbv2 describe-target-groups --region $Region --names $Name 2>$null | ConvertFrom-Json)
-    if ($existing -and $existing.TargetGroups.Count -gt 0) { return $existing.TargetGroups[0].TargetGroupArn }
-    $created = Invoke-Aws -Arguments @(
-        "elbv2","create-target-group","--region",$Region,"--name",$Name,"--protocol","HTTP","--port",$Port,
-        "--vpc-id",$VpcId,"--target-type","ip","--health-check-path",$HealthCheckPath
-    ) -ErrorContext "create-target-group ($Name)" | ConvertFrom-Json
-    return $created.TargetGroups[0].TargetGroupArn
-}
-
-$BackendTargetGroupArn = Get-OrCreateTargetGroup -Name "fraud-detection-backend" -Port 4000 -HealthCheckPath "/health"
-$FrontendTargetGroupArn = Get-OrCreateTargetGroup -Name "fraud-detection-frontend" -Port 8080 -HealthCheckPath "/"
-
-# One ALB, two listeners: :80 -> frontend (what the audience visits), :8081 -> backend
-# (OAuth callback + direct API access). Avoids the cost/time of a second ALB for a demo.
-function Get-OrCreateListener {
-    param([int]$Port, [string]$TargetGroupArn)
-    $existing = (& aws elbv2 describe-listeners --region $Region --load-balancer-arn $AlbArn 2>$null | ConvertFrom-Json)
-    $match = $existing.Listeners | Where-Object { $_.Port -eq $Port }
-    if ($match) { return }
-    Invoke-Aws -Arguments @(
-        "elbv2","create-listener","--region",$Region,"--load-balancer-arn",$AlbArn,"--protocol","HTTP","--port",$Port,
-        "--default-actions","Type=forward,TargetGroupArn=$TargetGroupArn"
-    ) -ErrorContext "create-listener ($Port)" | Out-Null
-}
-Get-OrCreateListener -Port 80 -TargetGroupArn $FrontendTargetGroupArn
-Get-OrCreateListener -Port 8081 -TargetGroupArn $BackendTargetGroupArn
-
-$backendUrl = "http://${AlbDnsName}:8081"
-$frontendUrl = "http://$AlbDnsName"
 
 $CognitoDomain = (Invoke-Aws -Arguments @("cognito-idp","describe-user-pool","--region",$Region,"--user-pool-id",$CognitoUserPoolId,"--query","UserPool.Domain","--output","text") -ErrorContext "describe-user-pool (domain)").Trim()
 
-Write-Host "`n=== Creating Cognito app client for this demo ===" -ForegroundColor Cyan
+Write-Host "`n=== Registering this demo's callback with Mesh's admin app client ===" -ForegroundColor Cyan
 $redirectUri = "$backendUrl/auth/callback"
-$existingClients = (& aws cognito-idp list-user-pool-clients --region $Region --user-pool-id $CognitoUserPoolId 2>$null | ConvertFrom-Json).UserPoolClients
-$existingClient = $existingClients | Where-Object { $_.ClientName -eq $CognitoAppClientName }
-if ($existingClient) {
-    Invoke-Aws -Arguments @(
+# Deliberately NOT creating fraud-detection's own Cognito app client — confirmed live: Mesh's
+# deployed Auth:IdPAudience trusts exactly one Cognito audience (this demo's own client would
+# never pass Mesh's audience check; see Get-MeshAdminToken's comment for the full root-cause
+# chain). Registering this callback against $MeshAdminClientId instead means real end-user
+# login goes through the SAME client Mesh already trusts, no Mesh-side change needed. That
+# client is public (no secret) — nothing for this demo to store in Secrets Manager either.
+# update-user-pool-client REPLACES the whole client config, not just CallbackURLs — must fetch
+# and resubmit the client's full current settings, only adding this URL if it's not already
+# present, so this never clobbers whatever else already uses that client (including your own
+# interactive admin login).
+$meshClientDetail = (Invoke-Aws -Arguments @("cognito-idp","describe-user-pool-client","--region",$Region,"--user-pool-id",$CognitoUserPoolId,"--client-id",$MeshAdminClientId) -ErrorContext "describe-user-pool-client (Mesh admin client)" | ConvertFrom-Json).UserPoolClient
+$existingCallbackUrls = @($meshClientDetail.CallbackURLs)
+if ($existingCallbackUrls -notcontains $redirectUri) {
+    $updatedCallbackUrls = $existingCallbackUrls + @($redirectUri)
+    $updateClientArgs = @(
         "cognito-idp","update-user-pool-client","--region",$Region,"--user-pool-id",$CognitoUserPoolId,
-        "--client-id",$existingClient.ClientId,"--callback-urls",$redirectUri,
-        "--supported-identity-providers","COGNITO","IIC",
-        "--allowed-o-auth-flows","code","--allowed-o-auth-scopes","email","openid","profile",
-        "--allowed-o-auth-flows-user-pool-client"
-    ) -ErrorContext "update-user-pool-client" | Out-Null
-    $cognitoClientId = $existingClient.ClientId
+        "--client-id",$MeshAdminClientId
+    )
+    $updateClientArgs += @("--callback-urls") + $updatedCallbackUrls
+    $updateClientArgs += @("--supported-identity-providers") + @($meshClientDetail.SupportedIdentityProviders)
+    $updateClientArgs += @("--allowed-o-auth-flows") + @($meshClientDetail.AllowedOAuthFlows)
+    $updateClientArgs += @("--allowed-o-auth-scopes") + @($meshClientDetail.AllowedOAuthScopes)
+    $updateClientArgs += @("--explicit-auth-flows") + @($meshClientDetail.ExplicitAuthFlows)
+    $updateClientArgs += @("--allowed-o-auth-flows-user-pool-client")
+    Invoke-Aws -Arguments $updateClientArgs -ErrorContext "update-user-pool-client (add fraud-detection callback)" | Out-Null
+    Write-Host "Added $redirectUri to Mesh admin client's callback URLs." -ForegroundColor Green
 } else {
-    $created = Invoke-Aws -Arguments @(
-        "cognito-idp","create-user-pool-client","--region",$Region,"--user-pool-id",$CognitoUserPoolId,
-        "--client-name",$CognitoAppClientName,"--generate-secret",
-        "--callback-urls",$redirectUri,
-        "--supported-identity-providers","COGNITO","IIC",
-        "--allowed-o-auth-flows","code","--allowed-o-auth-scopes","email","openid","profile",
-        "--allowed-o-auth-flows-user-pool-client",
-        "--explicit-auth-flows","ALLOW_REFRESH_TOKEN_AUTH"
-    ) -ErrorContext "create-user-pool-client" | ConvertFrom-Json
-    $cognitoClientId = $created.UserPoolClient.ClientId
+    Write-Host "$redirectUri already registered on Mesh admin client." -ForegroundColor Yellow
 }
-$cognitoDetail = Invoke-Aws -Arguments @("cognito-idp","describe-user-pool-client","--region",$Region,"--user-pool-id",$CognitoUserPoolId,"--client-id",$cognitoClientId) -ErrorContext "describe-user-pool-client" | ConvertFrom-Json
-$cognitoClientSecret = $cognitoDetail.UserPoolClient.ClientSecret
-$script:SecretValues += $cognitoClientSecret
-Write-Host "Cognito app client ready: $cognitoClientId (redirect URI: $redirectUri)" -ForegroundColor Green
+$cognitoClientId = $MeshAdminClientId
+Write-Host "Using Mesh's admin app client for login: $cognitoClientId (redirect URI: $redirectUri)" -ForegroundColor Green
 
-Write-Host "`n=== Storing secrets in Secrets Manager ===" -ForegroundColor Cyan
-function Set-SecretValue {
-    param([string]$Name, [string]$Value)
-    aws secretsmanager describe-secret --region $Region --secret-id $Name 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        Invoke-Aws -Arguments @("secretsmanager","put-secret-value","--region",$Region,"--secret-id",$Name,"--secret-string",$Value) -ErrorContext "put-secret-value ($Name)" -AdditionalSecrets @($Value) | Out-Null
-    } else {
-        Invoke-Aws -Arguments @("secretsmanager","create-secret","--region",$Region,"--name",$Name,"--secret-string",$Value) -ErrorContext "create-secret ($Name)" -AdditionalSecrets @($Value) | Out-Null
-    }
+# Mints a real Mesh admin-role token for the HITL-scrub maintenance step — /local/token is
+# Production-disabled, and HitlPoliciesController requires [Authorize(Policy = "AdminPolicy")]
+# on every route. Authenticates as the dedicated service account setup-fraud-detection-iam.ps1
+# provisions (USER_PASSWORD_AUTH against a real Cognito user in the "mesh-admins" group —
+# client_credentials can't work here, it's a client-identity token with no user, so it never
+# carries cognito:groups). Returns the ID token specifically: Mesh's admin-claim fallback reads
+# cognito:groups, which Cognito only puts on the ID token by default, not the access token —
+# same reasoning as auth_service.py's own Cognito path.
+#
+# Deliberately authenticates against $MeshAdminClientId (Mesh's OWN pre-existing admin app
+# client), NOT this demo's own $cognitoClientId — confirmed live: Mesh's deployed
+# Auth:IdPAudience trusts exactly one Cognito audience, and a token issued to a different app
+# client is rejected 401 before AdminPolicy is even evaluated (JWT bearer audience check fails
+# first). That client is public (no secret, confirmed via describe-user-pool-client) and already
+# has ALLOW_USER_PASSWORD_AUTH enabled — using the plain (non-admin) InitiateAuth flow here means
+# zero configuration changes to that shared, Mesh-owned client, and no SECRET_HASH to compute.
+function Get-MeshAdminToken {
+    $password = (aws secretsmanager get-secret-value --region $Region --secret-id $AutomationSecretName --query "SecretString" --output text 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "Failed to fetch '$AutomationUsername' password from Secrets Manager ($AutomationSecretName) — has setup-fraud-detection-iam.ps1 been run?" }
+    $script:SecretValues += $password
+
+    $authParams = "USERNAME=$AutomationUsername,PASSWORD=$password"
+    $authResult = Invoke-Aws -Arguments @(
+        "cognito-idp","initiate-auth","--region",$Region,
+        "--client-id",$MeshAdminClientId,"--auth-flow","USER_PASSWORD_AUTH",
+        "--auth-parameters",$authParams
+    ) -ErrorContext "initiate-auth ($AutomationUsername)" -AdditionalSecrets @($password) | ConvertFrom-Json
+    $idToken = $authResult.AuthenticationResult.IdToken
+    if (-not $idToken) { throw "initiate-auth succeeded but returned no IdToken for '$AutomationUsername'" }
+    $script:SecretValues += $idToken
+    return $idToken
 }
-$cognitoSecretName = "fraud-detection/dev/cognito-client-secret"
-Set-SecretValue -Name $cognitoSecretName -Value $cognitoClientSecret
-$cognitoSecretArn = (Invoke-Aws -Arguments @("secretsmanager","describe-secret","--region",$Region,"--secret-id",$cognitoSecretName) -ErrorContext "describe-secret" | ConvertFrom-Json).ARN
+
 
 function Register-TaskDefinition {
     param([string]$Family, [string]$Image, [int]$Port, [hashtable]$EnvVars, [array]$Secrets)
@@ -369,7 +598,8 @@ Register-TaskDefinition -Family $BackendServiceName -Image "${ecrHost}/${Backend
     COGNITO_CLIENT_ID = $cognitoClientId
     OAUTH_REDIRECT_URI = $redirectUri
     FRONTEND_ORIGIN = $frontendUrl
-} -Secrets @(@{ name = "COGNITO_CLIENT_SECRET"; valueFrom = $cognitoSecretArn })
+    OPA_BUNDLE_MAX_DELAY_SECONDS = "60"
+} -Secrets @()
 
 Register-TaskDefinition -Family $FrontendServiceName -Image "${ecrHost}/${FrontendRepoName}:${ImageTag}" -Port 8080 -EnvVars @{
     BACKEND_URL = $backendUrl
@@ -442,15 +672,19 @@ Invoke-EcsMaintenanceTask -Description "Seeding the shared Mongo database" -Comm
     "python3","scripts/seed_mongo.py","--mongo-uri",$MongoConnectionString,"--db-name",$MongoDatabaseName,"--clear"
 ) -AdditionalSecrets @($MongoConnectionString)
 
+$meshAdminToken = Get-MeshAdminToken
 Invoke-EcsMaintenanceTask -Description "Clearing this demo's prior workflow manifests + HITL policy entries" -Command @(
-    "python3","scripts/reset_hitl_policy.py","--mesh-base-url",$MeshBaseUrl,"--mesh-mongo-uri",$MongoConnectionString
-) -AdditionalSecrets @($MongoConnectionString)
+    "python3","scripts/reset_hitl_policy.py","--mesh-base-url",$MeshBaseUrl,"--mesh-mongo-uri",$MongoConnectionString,"--mesh-admin-token",$meshAdminToken
+) -AdditionalSecrets @($MongoConnectionString, $meshAdminToken)
 
 Write-Host "`n✅ Fraud-detection demo deployed to AWS." -ForegroundColor Green
-Write-Host "   Backend:  $backendUrl" -ForegroundColor Cyan
-Write-Host "   Frontend: $frontendUrl" -ForegroundColor Cyan
-Write-Host "   NOTE: /auth/login and /auth/callback are not implemented in the backend yet" -ForegroundColor Yellow
-Write-Host "   (Workstream B, Cognito variant) — until then, Mesh calls from this deployment" -ForegroundColor Yellow
-Write-Host "   will fail for admin-gated actions." -ForegroundColor Yellow
+Write-Host "   App (frontend + backend, unified behind CloudFront): $frontendUrl" -ForegroundColor Cyan
+Write-Host "   OAuth callback registered with Cognito: $redirectUri" -ForegroundColor Cyan
+Write-Host "   Direct ALB access (debugging only, plain HTTP, bypasses CloudFront):" -ForegroundColor Gray
+Write-Host "     Frontend: http://$AlbDnsName" -ForegroundColor Gray
+Write-Host "     Backend:  http://${AlbDnsName}:8081" -ForegroundColor Gray
 Write-Host "   Real-user login requires IAM Identity Center SAML federation into the 'mesh-admins'" -ForegroundColor Yellow
-Write-Host "   group (same as Mesh's own admin path) — see this session's notes for details." -ForegroundColor Yellow
+Write-Host "   group (same as Mesh's own admin path)." -ForegroundColor Yellow
+if (-not $existingDistribution) {
+    Write-Host "   NOTE: CloudFront distribution was just created — allow ~15-20 minutes before the app URL works." -ForegroundColor Yellow
+}

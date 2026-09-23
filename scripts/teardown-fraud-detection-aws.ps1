@@ -3,14 +3,16 @@
 .SYNOPSIS
     Tear down the fraud-detection demo's AWS resources: ECS services/cluster, ALB + target
     groups, the ECR repositories (backend/frontend images), the security groups (including the
-    ingress rule granted on Mesh's Mongo security group), the Cognito app client, the Secrets
-    Manager secret, this demo's tagged entries in Mesh's HITL policy, and the entire
-    fraud_detection_demo database.
+    ingress rule granted on Mesh's Mongo security group), this demo's callback URL entry on
+    Mesh's shared admin Cognito app client, this demo's tagged entries in Mesh's HITL policy,
+    and the entire fraud_detection_demo database.
 
 .DESCRIPTION
     Deletes only resources this demo's own deploy script created — never touches Mesh's own
-    ECS cluster, Cognito user pool, or Mongo EC2 instance beyond revoking the one ingress rule
-    granted to fraud-detection's task security group.
+    ECS cluster, Cognito user pool, admin app client itself (only this demo's one callback URL
+    entry on it — see deploy script for why this demo never creates its own Cognito client), or
+    Mongo EC2 instance beyond revoking the one ingress rule granted to fraud-detection's task
+    security group.
 
     Assumes the caller is already authenticated (`aws sts get-caller-identity` succeeds).
 
@@ -55,7 +57,17 @@ param(
 
     [string]$MongoSecurityGroupId = "sg-0429199286ae27ecc",
     [string]$MongoDatabaseName = "fraud_detection_demo",
-    [string]$CognitoUserPoolId = "us-east-2_D0FCCAyEB"
+    [string]$CognitoUserPoolId = "us-east-2_D0FCCAyEB",
+
+    # Must match setup-fraud-detection-iam.ps1's defaults — see deploy-fraud-detection-to-aws.ps1
+    # for the full rationale (/local/token is Production-disabled; HitlPoliciesController
+    # requires a real admin-role token).
+    [string]$AutomationUsername = "fraud-detection-automation@synchtron-test.local",
+    [string]$AutomationSecretName = "fraud-detection/dev/automation-user-password",
+
+    # Mesh's OWN pre-existing Cognito admin app client — confirmed live to be the one and only
+    # audience Mesh's deployed Auth:IdPAudience trusts. See deploy-fraud-detection-to-aws.ps1.
+    [string]$MeshAdminClientId = "2fvmn3og01l444d57fbojla6k6"
 )
 
 $ErrorActionPreference = "Stop"
@@ -65,8 +77,6 @@ $FrontendServiceName = "fraud-detection-frontend"
 $AlbName = "fraud-detection-dev-useast2"
 $TaskSecurityGroupName = "fraud-detection-task-dev-useast2"
 $AlbSecurityGroupName = "fraud-detection-alb-dev-useast2"
-$CognitoAppClientName = "fraud-detection-demo"
-$CognitoSecretName = "fraud-detection/dev/cognito-client-secret"
 
 $script:SecretValues = @($MongoConnectionString)
 
@@ -97,9 +107,10 @@ Write-Host "Account: $($callerIdentity.Account), region: $Region" -ForegroundCol
 # the teardown script's own process (e.g. a GitHub Actions hosted runner) cannot reach it at all.
 # See deploy-fraud-detection-to-aws.ps1's identical Invoke-EcsMaintenanceTask for the full
 # rationale. ---
-$clusterExists = $false
-aws ecs describe-clusters --region $Region --clusters $ClusterName --query "clusters[?status=='ACTIVE']" 2>$null | Out-Null
-if ($LASTEXITCODE -eq 0) { $clusterExists = $true }
+# describe-clusters exits 0 even when --clusters names a cluster that doesn't exist (empty
+# "clusters" array, no error) — existence must come from the array content, not $LASTEXITCODE.
+$activeClustersForTeardown = (aws ecs describe-clusters --region $Region --clusters $ClusterName --query "clusters[?status=='ACTIVE']" --output json 2>$null | ConvertFrom-Json)
+$clusterExists = ($activeClustersForTeardown -and $activeClustersForTeardown.Count -gt 0)
 
 if ($clusterExists) {
     $vpc = (& aws ec2 describe-vpcs --region $Region --filters "Name=is-default,Values=true" 2>$null | ConvertFrom-Json).Vpcs[0]
@@ -139,9 +150,29 @@ if ($clusterExists) {
             }
         }
 
+        # See deploy-fraud-detection-to-aws.ps1's identical Get-MeshAdminToken for the full
+        # rationale (/local/token is Production-disabled; HitlPoliciesController requires a real
+        # admin-role token; client_credentials can't produce one since it carries no user/groups;
+        # authenticates against Mesh's OWN pre-existing admin app client — $MeshAdminClientId —
+        # not this demo's own client, since Mesh only trusts that one audience. That client is
+        # public with ALLOW_USER_PASSWORD_AUTH already enabled, so plain (non-admin) InitiateAuth
+        # needs no SECRET_HASH and no lookup of this demo's own client at all).
+        $password = (aws secretsmanager get-secret-value --region $Region --secret-id $AutomationSecretName --query "SecretString" --output text 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "Failed to fetch '$AutomationUsername' password from Secrets Manager ($AutomationSecretName) — has setup-fraud-detection-iam.ps1 been run?" }
+        $script:SecretValues += $password
+
+        $authResult = Invoke-Aws -Arguments @(
+            "cognito-idp","initiate-auth","--region",$Region,
+            "--client-id",$MeshAdminClientId,"--auth-flow","USER_PASSWORD_AUTH",
+            "--auth-parameters","USERNAME=$AutomationUsername,PASSWORD=$password"
+        ) -ErrorContext "initiate-auth ($AutomationUsername)" -AdditionalSecrets @($password) | ConvertFrom-Json
+        $meshAdminToken = $authResult.AuthenticationResult.IdToken
+        if (-not $meshAdminToken) { throw "initiate-auth succeeded but returned no IdToken for '$AutomationUsername'" }
+        $script:SecretValues += $meshAdminToken
+
         Invoke-EcsMaintenanceTask -Description "Clearing this demo's workflow manifests + HITL policy entries" -Command @(
-            "python3","scripts/reset_hitl_policy.py","--mesh-base-url",$MeshBaseUrl,"--mesh-mongo-uri",$MongoConnectionString
-        ) -AdditionalSecrets @($MongoConnectionString)
+            "python3","scripts/reset_hitl_policy.py","--mesh-base-url",$MeshBaseUrl,"--mesh-mongo-uri",$MongoConnectionString,"--mesh-admin-token",$meshAdminToken
+        ) -AdditionalSecrets @($MongoConnectionString, $meshAdminToken)
 
         Invoke-EcsMaintenanceTask -Description "Dropping the $MongoDatabaseName database" -Command @(
             "python3","scripts/drop_database.py","--mongo-uri",$MongoConnectionString,"--db-name",$MongoDatabaseName
@@ -160,6 +191,22 @@ foreach ($svc in @($BackendServiceName, $FrontendServiceName)) {
         Write-Host "Draining and deleting service '$svc'..." -ForegroundColor Gray
         aws ecs update-service --region $Region --cluster $ClusterName --service $svc --desired-count 0 2>&1 | Out-Null
         aws ecs delete-service --region $Region --cluster $ClusterName --service $svc --force 2>&1 | Out-Null
+
+        # A deleted service stays DRAINING for a while even after this teardown goes on to delete
+        # the whole cluster and a same-named replacement cluster gets created by the next deploy —
+        # CreateService for the same (cluster name, service name) pair fails outright
+        # ("Unable to Start a service that is still Draining") until this clears. Wait here so a
+        # deploy script run immediately after this one doesn't need a manual retry.
+        Write-Host "Waiting for '$svc' to fully drain before continuing..." -ForegroundColor Gray
+        $drained = $false
+        for ($i = 0; $i -lt 24; $i++) {
+            $status = (& aws ecs describe-services --region $Region --cluster $ClusterName --services $svc 2>$null | ConvertFrom-Json).services[0].status
+            if (-not $status -or $status -eq "INACTIVE") { $drained = $true; break }
+            Start-Sleep -Seconds 10
+        }
+        if (-not $drained) {
+            Write-Host "WARNING: '$svc' did not reach INACTIVE within 4 minutes — a deploy run immediately after this may hit the draining race above." -ForegroundColor Yellow
+        }
     } else {
         Write-Host "Service '$svc' does not exist — skipping." -ForegroundColor Gray
     }
@@ -245,23 +292,37 @@ if ($albSg -and $albSg.Count -gt 0) {
     Remove-SecurityGroupWithRetry -GroupId $albSg[0].GroupId -Label $AlbSecurityGroupName
 }
 
-Write-Host "`n=== Deleting Cognito app client ===" -ForegroundColor Cyan
-$existingClients = (& aws cognito-idp list-user-pool-clients --region $Region --user-pool-id $CognitoUserPoolId 2>$null | ConvertFrom-Json).UserPoolClients
-$existingClient = $existingClients | Where-Object { $_.ClientName -eq $CognitoAppClientName }
-if ($existingClient) {
-    aws cognito-idp delete-user-pool-client --region $Region --user-pool-id $CognitoUserPoolId --client-id $existingClient.ClientId 2>&1 | Out-Null
-    Write-Host "Deleted Cognito app client '$CognitoAppClientName'." -ForegroundColor Gray
+Write-Host "`n=== Removing this demo's callback from Mesh's admin app client ===" -ForegroundColor Cyan
+# deploy-fraud-detection-to-aws.ps1 registers this demo's own callback URL on Mesh's EXISTING
+# admin Cognito app client rather than creating a separate client (Mesh's deployed
+# Auth:IdPAudience trusts exactly one Cognito audience) — teardown must remove only THIS demo's
+# entry from that shared client's CallbackURLs, never delete the client itself or touch anyone
+# else's callback registered on it. Look up the CloudFront domain (read-only — this script
+# doesn't delete the distribution itself) to know the exact URL to remove; if the distribution
+# is already gone, there's nothing to remove either.
+$teardownDistribution = (& aws cloudfront list-distributions --region $Region 2>$null | ConvertFrom-Json).DistributionList.Items | Where-Object { $_.Comment -eq $AlbName }
+if ($teardownDistribution) {
+    $teardownRedirectUri = "https://$($teardownDistribution.DomainName)/auth/callback"
+    $meshClientDetail = (& aws cognito-idp describe-user-pool-client --region $Region --user-pool-id $CognitoUserPoolId --client-id $MeshAdminClientId 2>$null | ConvertFrom-Json).UserPoolClient
+    if ($meshClientDetail -and (@($meshClientDetail.CallbackURLs) -contains $teardownRedirectUri)) {
+        $remainingCallbackUrls = @($meshClientDetail.CallbackURLs | Where-Object { $_ -ne $teardownRedirectUri })
+        $updateClientArgs = @(
+            "cognito-idp","update-user-pool-client","--region",$Region,"--user-pool-id",$CognitoUserPoolId,
+            "--client-id",$MeshAdminClientId
+        )
+        $updateClientArgs += @("--callback-urls") + $remainingCallbackUrls
+        $updateClientArgs += @("--supported-identity-providers") + @($meshClientDetail.SupportedIdentityProviders)
+        $updateClientArgs += @("--allowed-o-auth-flows") + @($meshClientDetail.AllowedOAuthFlows)
+        $updateClientArgs += @("--allowed-o-auth-scopes") + @($meshClientDetail.AllowedOAuthScopes)
+        $updateClientArgs += @("--explicit-auth-flows") + @($meshClientDetail.ExplicitAuthFlows)
+        $updateClientArgs += @("--allowed-o-auth-flows-user-pool-client")
+        Invoke-Aws -Arguments $updateClientArgs -ErrorContext "update-user-pool-client (remove fraud-detection callback)" | Out-Null
+        Write-Host "Removed $teardownRedirectUri from Mesh admin client's callback URLs." -ForegroundColor Gray
+    } else {
+        Write-Host "$teardownRedirectUri not registered on Mesh admin client — skipping." -ForegroundColor Gray
+    }
 } else {
-    Write-Host "Cognito app client '$CognitoAppClientName' does not exist — skipping." -ForegroundColor Gray
-}
-
-Write-Host "`n=== Deleting Secrets Manager secret ===" -ForegroundColor Cyan
-aws secretsmanager describe-secret --region $Region --secret-id $CognitoSecretName 2>$null | Out-Null
-if ($LASTEXITCODE -eq 0) {
-    aws secretsmanager delete-secret --region $Region --secret-id $CognitoSecretName --force-delete-without-recovery 2>&1 | Out-Null
-    Write-Host "Deleted secret '$CognitoSecretName'." -ForegroundColor Gray
-} else {
-    Write-Host "Secret '$CognitoSecretName' does not exist — skipping." -ForegroundColor Gray
+    Write-Host "No CloudFront distribution found for '$AlbName' — nothing to remove." -ForegroundColor Gray
 }
 
 Write-Host "`n✅ Fraud-detection demo torn down on AWS — ECS/ALB/security groups/Cognito client/secret removed, HITL policy entries scrubbed, database dropped." -ForegroundColor Green

@@ -109,18 +109,25 @@ class AuthService:
 
         if self.provider == "cognito":
             token_url = f"https://{self._cognito_domain}.auth.{self._cognito_region}.amazoncognito.com/oauth2/token"
+            # No client-secret auth for a public client (COGNITO_CLIENT_SECRET unset/empty) —
+            # e.g. Mesh's own admin app client, which this deployment authenticates against
+            # directly rather than creating its own confidential client (see deploy script for
+            # why). Cognito's /oauth2/token accepts an authorization_code exchange with no client
+            # authentication at all for a public client; sending an empty-password Basic auth
+            # header instead of omitting it entirely risks Cognito rejecting the request.
+            request_kwargs = {
+                "data": {
+                    "grant_type": "authorization_code",
+                    "client_id": self._cognito_client_id,
+                    "code": code,
+                    "redirect_uri": self._redirect_uri,
+                },
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+            }
+            if self._cognito_client_secret:
+                request_kwargs["auth"] = (self._cognito_client_id, self._cognito_client_secret)
             async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    token_url,
-                    data={
-                        "grant_type": "authorization_code",
-                        "client_id": self._cognito_client_id,
-                        "code": code,
-                        "redirect_uri": self._redirect_uri,
-                    },
-                    auth=(self._cognito_client_id, self._cognito_client_secret),
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                )
+                response = await client.post(token_url, **request_kwargs)
             response.raise_for_status()
             token_data = response.json()
             # The ID token, not the access token: Mesh's AdminRoleAuthorizationHandler fallback

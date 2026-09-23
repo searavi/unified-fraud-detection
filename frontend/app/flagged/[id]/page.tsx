@@ -247,15 +247,15 @@ export default function FlaggedAccountDetailsPage() {
                         <div className="flex-1">
                             <h3 className="font-semibold text-red-800">AI Investigation Failed</h3>
                             <p className="text-sm text-red-700 mt-1">{investigation.error}</p>
-                            {investigation.policyAction.status === 'failed' && investigation.policyAction.message && (
-                                <p className="text-sm text-red-800 font-medium mt-2">
+                            {(investigation.policyAction.status === 'failed' || investigation.policyAction.status === 'propagating') && investigation.policyAction.message && (
+                                <p className={`text-sm font-medium mt-2 ${investigation.policyAction.status === 'failed' ? 'text-red-800' : 'text-slate-600'}`}>
                                     {investigation.policyAction.message}
                                 </p>
                             )}
                             {investigation.errorCode === 'hitl_policy_missing' && (
                                 <Button
                                     onClick={handleEnableWorkflowPolicy}
-                                    disabled={investigation.policyAction.status === 'enabling'}
+                                    disabled={investigation.policyAction.status === 'enabling' || investigation.policyAction.status === 'propagating'}
                                     size="sm"
                                     className="mt-3 bg-indigo-600 hover:bg-indigo-700 text-white"
                                 >
@@ -264,9 +264,23 @@ export default function FlaggedAccountDetailsPage() {
                                             <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                                             Enabling workflow execution...
                                         </>
+                                    ) : investigation.policyAction.status === 'propagating' ? (
+                                        <>
+                                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                            Waiting for policy to propagate...
+                                        </>
                                     ) : (
                                         'Enable Workflow Execution'
                                     )}
+                                </Button>
+                            )}
+                            {investigation.errorCode === 'not_logged_in' && (
+                                <Button
+                                    asChild
+                                    size="sm"
+                                    className="mt-3 bg-indigo-600 hover:bg-indigo-700 text-white"
+                                >
+                                    <a href="/auth/login">Log in</a>
                                 </Button>
                             )}
                         </div>

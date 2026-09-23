@@ -114,6 +114,25 @@ foreach ($agentId in $AgentIds) {
         Write-Host "Scaling down and deleting ECS service '$serviceName'..." -ForegroundColor Gray
         aws ecs update-service --region $Region --cluster $ClusterName --service $serviceName --desired-count 0 2>&1 | Out-Null
         aws ecs delete-service --region $Region --cluster $ClusterName --service $serviceName --force 2>&1 | Out-Null
+
+        # ECS keeps a deleted service in DRAINING for a while before it reaches INACTIVE. A
+        # CreateService for the same name while still DRAINING fails outright ("Unable to Start
+        # a service that is still Draining") — and when that happens, Mesh's own
+        # ContainerDeploymentService rollback deletes the secrets it just wrote WITHOUT
+        # ForceDeleteWithoutRecovery, leaving them soft-deleted and blocking the NEXT retry too
+        # ("marked for deletion", 30-day recovery window). Waiting here for real INACTIVE avoids
+        # triggering that Mesh-side rollback path at all, so a script that runs register right
+        # after unregister doesn't need manual secret cleanup in between.
+        Write-Host "Waiting for '$serviceName' to fully drain before returning..." -ForegroundColor Gray
+        $drained = $false
+        for ($i = 0; $i -lt 24; $i++) {
+            $status = (& aws ecs describe-services --region $Region --cluster $ClusterName --services $serviceName 2>$null | ConvertFrom-Json).services[0].status
+            if (-not $status -or $status -eq "INACTIVE") { $drained = $true; break }
+            Start-Sleep -Seconds 10
+        }
+        if (-not $drained) {
+            Write-Host "WARNING: '$serviceName' did not reach INACTIVE within 4 minutes — a re-registration run immediately after this may hit the draining race above." -ForegroundColor Yellow
+        }
     } else {
         Write-Host "ECS service '$serviceName' does not exist — skipping." -ForegroundColor Gray
     }

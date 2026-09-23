@@ -223,6 +223,7 @@ Invoke-Az -AdditionalSecrets @($acrPassword) -Arguments @(
         "AZURE_CLIENT_ID=$EntraClientId",
         "OAUTH_REDIRECT_URI=$redirectUri",
         "FRONTEND_ORIGIN=$frontendUrl",
+        "OPA_BUNDLE_MAX_DELAY_SECONDS=60",
         "MONGODB_CONNECTION_STRING=secretref:mongo-connection-string",
         "AZURE_CLIENT_SECRET=secretref:entra-client-secret"
 ) -ErrorContext "az containerapp create (backend)" | Out-Null

@@ -420,9 +420,12 @@ def get_account_resolutions(
 async def enable_workflow_policy(request: Request):
     """
     Push a HITL policy to Mesh authorizing the fraud-investigation workflow and its agents to
-    execute, wait for OPA's bundle poll, and verify the policy is now active. Used by the
-    frontend's "Enable Workflow Execution" recovery action when Mesh blocks a run with
-    errorCode "hitl_policy_missing".
+    execute, PUT it, and GET it back to confirm Mesh's own IPolicyStore reflects the write.
+    Does NOT wait for OPA's bundle poll to pick the change up (30-60s in cloud deployments,
+    1-2s locally) — stream_investigation retries the actual execute attempt on a
+    policy-not-yet-propagated error instead, so this call itself stays fast. Used by the
+    "Enable Workflow Execution" recovery action when Mesh blocks a run with errorCode
+    "hitl_policy_missing".
     """
     if not investigation_service:
         raise HTTPException(status_code=503, detail="Investigation service not initialized")
@@ -433,7 +436,7 @@ async def enable_workflow_policy(request: Request):
         # failing here with a clear message beats a confusing 404 from that dead-end fallback.
         raise HTTPException(status_code=401, detail="Please log in (GET /auth/login) before enabling workflow execution")
     try:
-        return await investigation_service.enable_workflow_policy_and_wait(mesh_token=mesh_token)
+        return await investigation_service.trigger_workflow_policy_update(mesh_token=mesh_token)
     except Exception as e:
         logger.error(f"❌ Failed to enable workflow policy: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to enable workflow policy: {str(e)}")
@@ -472,7 +475,10 @@ async def stream_investigation(
         if not_logged_in:
             # /local/token is Production-disabled on any deployment with a real IdP configured —
             # surfacing this immediately beats a confusing failure deep in the Mesh call below.
-            yield {"event": "investigation_error", "data": json.dumps({"error": "Please log in (GET /auth/login) before starting an investigation"})}
+            yield {"event": "investigation_error", "data": json.dumps({
+                "error": "Please log in before starting an investigation",
+                "errorCode": "not_logged_in",
+            })}
             return
         try:
             async for event in investigation_service.stream_investigation(user_id, investigation_id, mesh_token=mesh_token):
