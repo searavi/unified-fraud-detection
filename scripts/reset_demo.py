@@ -305,13 +305,27 @@ def step_rebuild_backend_frontend(repo: Path, mongo_uri: str, db_name: str) -> N
         BACKEND_IMAGE_TAG,
     ])
 
-    run(["docker", "build", "-f", "frontend.Dockerfile", "-t", FRONTEND_IMAGE_TAG, "."], cwd=str(repo))
+    # frontend.Dockerfile's build stage runs `next build` once at image-build time — its own
+    # header explains why BACKEND_URL/NEXT_PUBLIC_BACKEND_URL must be --build-arg, not just the
+    # docker run -e values below: next.config.js's rewrites() destination and every
+    # NEXT_PUBLIC_* reference are both baked in at build time (routes manifest / client bundle),
+    # neither re-read at `next start`. A build-arg-less `docker build` here silently falls back
+    # to next.config.js's own http://localhost:4000 default, with no runtime override possible —
+    # confirmed live: /api/* rewrites 404 even though the -e values below look correct.
+    frontend_backend_url = f"http://{BACKEND_CONTAINER_NAME}:4000"
+    frontend_public_backend_url = f"http://localhost:{DEMO_BACKEND_PORT}"
+    run([
+        "docker", "build", "-f", "frontend.Dockerfile", "-t", FRONTEND_IMAGE_TAG,
+        "--build-arg", f"BACKEND_URL={frontend_backend_url}",
+        "--build-arg", f"NEXT_PUBLIC_BACKEND_URL={frontend_public_backend_url}",
+        ".",
+    ], cwd=str(repo))
     subprocess.run(["docker", "rm", "-f", FRONTEND_CONTAINER_NAME], capture_output=True)
     run([
         "docker", "run", "-d", "--name", FRONTEND_CONTAINER_NAME,
         "--network", AGENT_NETWORK,
-        "-e", f"BACKEND_URL=http://{BACKEND_CONTAINER_NAME}:4000",
-        "-e", f"NEXT_PUBLIC_BACKEND_URL=http://localhost:{DEMO_BACKEND_PORT}",
+        "-e", f"BACKEND_URL={frontend_backend_url}",
+        "-e", f"NEXT_PUBLIC_BACKEND_URL={frontend_public_backend_url}",
         "-p", f"{DEMO_FRONTEND_PORT}:8080",
         FRONTEND_IMAGE_TAG,
     ])

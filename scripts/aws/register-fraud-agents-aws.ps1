@@ -218,6 +218,10 @@ try {
         $runtimeConfig = Get-Content (Join-Path $bundleDir "runtime-config.json") -Raw | ConvertFrom-Json
         # SERVICE_PORT must match Mesh's own ContainerRuntime:Port (9090) — see -AgentServicePort.
         $runtimeConfig | Add-Member -NotePropertyName SERVICE_PORT -NotePropertyValue $AgentServicePort -Force
+        # Required for the /invoke route's invocation-token exchange (mesh_invocation_auth.py) —
+        # without it, every real Mesh-dispatched invocation 401s as "misconfigured" the moment
+        # that Python-side auth port ships, since MESHAUTH__ENDPOINTURL defaults to empty.
+        $runtimeConfig | Add-Member -NotePropertyName MESHAUTH__ENDPOINTURL -NotePropertyValue $MeshBaseUrl -Force
         $runtimeConfig | Add-Member -NotePropertyName MONGODB_DATABASE -NotePropertyValue $MongoDatabaseName -Force
         $runtimeConfig | Add-Member -NotePropertyName LLM_PROVIDER -NotePropertyValue $LlmProvider -Force
         if ($LlmProvider -eq "gemini") {

@@ -3,19 +3,35 @@
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import Toggle from './Toggle'
-import { Activity, LogIn } from 'lucide-react'
+import { Activity, LogIn, LogOut } from 'lucide-react'
 import { ThemeProvider } from 'next-themes'
 import { Button } from '@/components/ui/button'
 
 export default function Navbar() {
-	const [showLogin, setShowLogin] = useState(false)
+	const [authStatus, setAuthStatus] = useState<{ loginAvailable: boolean; loggedIn: boolean } | null>(null)
 
-	useEffect(() => {
+	const checkAuthStatus = () => {
 		fetch('/auth/status')
 			.then((res) => (res.ok ? res.json() : null))
-			.then((data) => setShowLogin(Boolean(data?.login_available) && !data?.logged_in))
-			.catch(() => setShowLogin(false))
+			.then((data) =>
+				setAuthStatus({
+					loginAvailable: Boolean(data?.login_available),
+					loggedIn: Boolean(data?.logged_in),
+				})
+			)
+			.catch(() => setAuthStatus({ loginAvailable: false, loggedIn: false }))
+	}
+
+	useEffect(() => {
+		checkAuthStatus()
 	}, [])
+
+	const handleLogout = async () => {
+		await fetch('/auth/logout', { method: 'POST' })
+		// Reload rather than just re-checking status: any page-local data fetched while logged
+		// in (e.g. the flagged list) needs to re-run its own gate too, not just the navbar.
+		window.location.href = '/'
+	}
 
   	return (
     	<ThemeProvider attribute='data-theme' enableSystem>
@@ -30,12 +46,18 @@ export default function Navbar() {
  			           	</div>
             			<div className="flex items-center space-x-2">
                 			<Toggle />
-							{showLogin && (
+							{authStatus?.loginAvailable && !authStatus.loggedIn && (
 								<Button asChild size="sm">
 									<a href="/auth/login">
 										<LogIn className="h-4 w-4 mr-2" />
 										Login
 									</a>
+								</Button>
+							)}
+							{authStatus?.loginAvailable && authStatus.loggedIn && (
+								<Button variant="outline" size="sm" onClick={handleLogout}>
+									<LogOut className="h-4 w-4 mr-2" />
+									Logout
 								</Button>
 							)}
             			</div>

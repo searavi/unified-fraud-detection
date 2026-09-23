@@ -123,6 +123,19 @@ class InvestigationService:
         self._policy_updated_at: Optional[float] = None
         logger.info(f"Investigation service initialized — Mesh at {self._mesh_base_url}")
 
+    async def fetch_local_dev_token(self) -> str:
+        """Mints a token from Mesh's dev-only /local/token endpoint. [AllowAnonymous] and
+        Production-disabled — used both as _mesh_auth_header's fallback for every Mesh call when
+        no real session token exists, and by main.py's /auth/login to simulate a real login
+        locally (no IdP configured): storing this in the session makes "logged in" state, and
+        therefore the frontend's login gate, actually testable without AWS/Azure.
+        """
+        response = await self._mesh_client.get(
+            f"{self._mesh_base_url}/api/v1/mesh/security/local/token",
+        )
+        response.raise_for_status()
+        return response.json()["token"]
+
     async def _mesh_auth_header(self, mesh_token: Optional[str] = None) -> Dict[str, str]:
         """Builds the Authorization header for a Mesh call.
 
@@ -130,19 +143,14 @@ class InvestigationService:
         session — see main.py's /auth/callback), it's used as-is: Mesh validates it directly,
         no Mesh-side exchange, matching Web's own proxyMeshAdminRequest pattern. Otherwise falls
         back to minting a local-dev token: Mesh's workflow endpoints require JWT claims
-        (ExtractHitlContextFromClaims) — an unauthenticated call gets a 401. The /local/token
-        endpoint is [AllowAnonymous] and non-production only, matching local Docker setups —
-        this fallback path is unreachable once a real IdP is configured (see auth_service.py)
-        and the caller has actually logged in.
+        (ExtractHitlContextFromClaims) — an unauthenticated call gets a 401. This fallback path is
+        unreachable once a real IdP is configured (see auth_service.py) and the caller has
+        actually logged in.
         """
         if mesh_token:
             return {"Authorization": f"Bearer {mesh_token}"}
 
-        response = await self._mesh_client.get(
-            f"{self._mesh_base_url}/api/v1/mesh/security/local/token",
-        )
-        response.raise_for_status()
-        token = response.json()["token"]
+        token = await self.fetch_local_dev_token()
         return {"Authorization": f"Bearer {token}"}
 
     async def initialize(self, mesh_token: Optional[str] = None):
@@ -502,6 +510,19 @@ class InvestigationService:
             mesh_run_id = mesh_body.get("workflowExecutionId")
             if mesh_run_id and investigation_id in self._active_investigations:
                 self._active_investigations[investigation_id]["mesh_run_id"] = mesh_run_id
+
+            # Mark the flagged account "under_investigation" now that Mesh has confirmed the
+            # workflow actually started executing (not on every click — a HITL-blocked attempt
+            # above never reaches here). Nothing previously wrote this transition anywhere, so
+            # the Flagged Accounts page's stats always reported 0 under_investigation regardless
+            # of how many runs were in flight. Same update_flagged_account(user_id, updates)
+            # pattern resolve_flagged_account already uses for confirmed_fraud/cleared.
+            if self.aerospike_service and self.aerospike_service.is_connected():
+                self.aerospike_service.update_flagged_account(user_id, {
+                    "status": "under_investigation",
+                    "investigation_id": investigation_id,
+                    "investigation_started_at": datetime.now().isoformat(),
+                })
 
             # Emit any remaining progress steps
             while emitted_steps < len(STEP_NAMES):

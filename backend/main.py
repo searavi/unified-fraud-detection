@@ -106,12 +106,18 @@ app.add_middleware(
 
 
 @app.get("/auth/login")
-def auth_login(request: Request):
-    """Redirects to the configured IdP's login page. 404s if no IdP is configured (local dev) —
-    the frontend should hide its login button in that case rather than link here.
+async def auth_login(request: Request):
+    """Redirects to the configured IdP's login page. When no IdP is configured (local dev),
+    simulates a login instead of 404ing: mints a /local/token and stores it in the session, same
+    as a real /auth/callback would — otherwise "logged in" state (and the frontend's login gate
+    built on it) could never be exercised without a real AWS/Azure deployment.
     """
     if not auth_service.enabled:
-        raise HTTPException(status_code=404, detail="No identity provider is configured for this deployment")
+        if not investigation_service:
+            raise HTTPException(status_code=503, detail="Investigation service not initialized")
+        token = await investigation_service.fetch_local_dev_token()
+        request.session["mesh_token"] = token
+        return RedirectResponse(os.environ.get("FRONTEND_URL_AFTER_LOGIN", "/"))
 
     state = secrets.token_urlsafe(24)
     request.session["oauth_state"] = state
@@ -140,11 +146,13 @@ async def auth_callback(request: Request, code: str = Query(...), state: str = Q
 
 @app.get("/auth/status")
 def auth_status(request: Request):
-    """Lets the frontend show whether a real login is available and whether the current
-    browser session is already logged in.
+    """Lets the frontend show whether a login is available and whether the current browser
+    session is already logged in. login_available is True for a real configured IdP OR local
+    dev's simulated /local/token login (see /auth/login) — both are real, clickable flows from
+    the frontend's point of view, so both should show the login button.
     """
     return {
-        "login_available": auth_service.enabled,
+        "login_available": auth_service.enabled or investigation_service is not None,
         "logged_in": "mesh_token" in request.session,
     }
 

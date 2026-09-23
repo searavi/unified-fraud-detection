@@ -10,8 +10,11 @@ Provider is selected by which env vars are present, never a separate flag: AZURE
 -> Entra (msal-python's ConfidentialClientApplication, mirroring Web/server/routes.ts's exact
 pattern — confirmed portable, no Node-specific machinery). COGNITO_USER_POOL_ID set -> Cognito
 hosted-UI OAuth2 authorization-code flow (plain httpx — Cognito's hosted UI is a standard OIDC
-endpoint, no SDK needed for the token exchange itself). Neither set -> auth disabled (local dev;
-investigation_service.py falls back to /local/token unchanged).
+endpoint, no SDK needed for the token exchange itself). Neither set -> this class reports
+.enabled = False, and main.py's /auth/login takes over directly: it simulates a login by minting
+a /local/token and storing it in the session itself (see InvestigationService.fetch_local_dev_token),
+rather than routing through this class at all — so "logged in" state, and the frontend's login
+gate built on it, are still exercisable locally without a real IdP.
 
 The resulting token is presented to Mesh UNMODIFIED (Authorization: Bearer <token>) — no
 Mesh-side token exchange, matching Web's own proxyMeshAdminRequest pattern exactly.

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -89,6 +89,25 @@ export default function FlaggedAccountsPage() {
     const [page, setPage] = useState(1)
     const pageSize = 20
 
+    // null = still checking; only decide what to render once this resolves, to avoid a flash
+    // of the list before we know whether a login is required.
+    const [authStatus, setAuthStatus] = useState<{ loginAvailable: boolean; loggedIn: boolean } | null>(null)
+    useEffect(() => {
+        fetch('/auth/status')
+            .then((res) => (res.ok ? res.json() : null))
+            .then((data) =>
+                setAuthStatus({
+                    loginAvailable: Boolean(data?.login_available),
+                    loggedIn: Boolean(data?.logged_in),
+                })
+            )
+            .catch(() => setAuthStatus({ loginAvailable: false, loggedIn: false }))
+    }, [])
+
+    // No login configured at all (local dev) -> show freely, same as today. Login configured but
+    // not yet logged in -> gate the list. Logged in -> show freely.
+    const canViewList = authStatus !== null && (!authStatus.loginAvailable || authStatus.loggedIn)
+
     // Build SWR key for accounts list
     const accountsParams = new URLSearchParams({
         page: page.toString(),
@@ -97,12 +116,17 @@ export default function FlaggedAccountsPage() {
     if (filter !== 'all') accountsParams.append('status', filter)
     if (debouncedSearch) accountsParams.append('search', debouncedSearch)
 
+    // Passing null as the key skips the fetch entirely until we know the user is allowed to see
+    // this data — avoids fetching (and briefly caching) it before the login gate resolves.
     const { data: accountsData, isLoading: loading, mutate: mutateAccounts } = useSWR<FlaggedResponse>(
-        `/api/flagged-accounts?${accountsParams}`,
+        canViewList ? `/api/flagged-accounts?${accountsParams}` : null,
         { keepPreviousData: true }
     )
     const { data: stats, isLoading: statsLoading, mutate: mutateStats } = useSWR<FlaggedStats>(
-        '/api/flagged-accounts/stats'
+        canViewList ? '/api/flagged-accounts/stats' : null,
+        // Always refetch on mount rather than trusting a possibly-stale cached value — this is
+        // the count that goes stale after starting an investigation elsewhere and navigating back.
+        { revalidateOnMount: true }
     )
 
     const accounts = accountsData?.accounts ?? []
@@ -128,6 +152,29 @@ export default function FlaggedAccountsPage() {
             setPage(1)
         }, 300)
         return () => clearTimeout(timer)
+    }
+
+    if (authStatus === null) {
+        return (
+            <div className="space-y-6 flex flex-col grow">
+                <Skeleton className="h-10 w-64" />
+                <div className="grid gap-4 md:grid-cols-4">
+                    {[...Array(4)].map((_, i) => <Skeleton key={i} className="h-24" />)}
+                </div>
+            </div>
+        )
+    }
+
+    if (!canViewList) {
+        return (
+            <div className="flex flex-col grow items-center justify-center text-center py-12">
+                <Shield className="h-12 w-12 text-muted-foreground mb-4" />
+                <h1 className="text-2xl font-bold mb-2">Login required</h1>
+                <p className="text-muted-foreground max-w-md">
+                    Use the Login button above to view flagged accounts.
+                </p>
+            </div>
+        )
     }
 
     return (

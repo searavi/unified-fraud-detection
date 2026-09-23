@@ -144,7 +144,11 @@ services:
   synktron-agent-service:
     build:
       context: ..
-      dockerfile: Agent/src/Synktron.AgentFramework.Python.Service/Dockerfile
+      # Points at Agent-mongo-fraud-agents (this session's active work, PR #106), not the
+      # sibling checkout literally named "Agent" (an unrelated, never-PR'd branch) — see
+      # docker/agent-service.local.Dockerfile's own header for why this isn't the real Dockerfile
+      # path directly.
+      dockerfile: unified-fraud-detection-mongo/docker/agent-service.local.Dockerfile
     container_name: synktron-agent-service
     depends_on:
       aerospike-db:
@@ -158,6 +162,9 @@ services:
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash-lite}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://localhost:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-mistral}
+      # Required for the /invoke route's invocation-token exchange (mesh_invocation_auth.py) —
+      # matches the backend's own MESH_BASE_URL convention below for this same local network.
+      - MESHAUTH__ENDPOINTURL=http://meshruntime:8080
       - PYTHONPATH=/app/src:/app/src/Synktron/AgentFramework/Python/Agents
     command: ["uvicorn", "Synktron.AgentFramework.Python.Service.main:app", "--host", "0.0.0.0", "--port", "8090"]
     networks:
