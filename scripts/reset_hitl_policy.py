@@ -1,13 +1,35 @@
 #!/usr/bin/env python3
 """
-Clears THIS demo's tagged workflow manifests out of Mesh's operational store and scrubs the
-matching entries out of Mesh's HITL policy document for the given tenant — never a blanket
-delete or a blanket policy overwrite, since the target Mesh deployment may be shared with other
-demos running their own workflows/agents in parallel at the same time.
+Scrubs this demo's entries out of Mesh's HITL policy document for the given tenant, and
+(optionally) clears its tagged workflow manifests out of Mesh's operational store — never a
+blanket delete or a blanket policy overwrite, since the target Mesh deployment may be shared
+with other demos running their own workflows/agents in parallel at the same time.
 
-Used identically by deploy-fraud-detection-to-azure.ps1 (pre-seed reset, so a fresh deploy
-reproduces the HITL block) and teardown-fraud-detection-azure.ps1 (final cleanup before the
-demo's own database is dropped).
+Two independent pieces of cleanup, bundled here but separately triggerable:
+  1. Policy scrub (pure Mesh HTTP GET + PUT, no Mongo): removes this demo's 4 fixed agent IDs
+     from agent_policies/agent_approvals unconditionally — this alone is enough to re-trigger
+     the HITL block on the next investigation (Gate 2 checks each agent's presence in
+     agent_policies). Also removes any workflow IDs passed in from workflow_policies/
+     workflow_approvals, when known.
+  2. Manifest cleanup (needs direct Mongo access — Mesh has no HTTP API to list workflow
+     manifests by tag): deletes this demo's tagged manifest(s) from Mesh's operational store,
+     and returns their workflow IDs so step 1 can also scrub the matching workflow_policies/
+     workflow_approvals entries.
+
+Pass --mesh-mongo-uri to get both (matches deploy-fraud-detection-to-azure.ps1's pre-seed reset
+and teardown-fraud-detection-azure.ps1's final cleanup). Omit it for a policy-only reset — no
+Mongo access needed, but stale workflow-id entries from old manifests are left in
+workflow_policies/workflow_approvals (harmless clutter — opaque GUIDs never reused by a future
+investigation) until the next full reset cleans them up.
+
+IMPORTANT if the backend is already running when you do a policy-only reset: it caches its
+current Mesh workflow ID in memory (InvestigationService._mesh_workflow_id) and only
+re-registers a fresh one if that's unset — a policy-only reset doesn't touch the workflow
+manifest at all, so the cached ID stays valid and this is safe. Only the FULL reset (with
+--mesh-mongo-uri) deletes the manifest the running backend's cached ID points to; if you run
+that against an already-running backend, force a new deployment of it afterward (e.g.
+`aws ecs update-service --force-new-deployment`) so it re-initializes with a fresh workflow
+manifest instead of trying to execute against one that no longer exists.
 
 Mirrors reset_demo.py's step_clear_workflow_manifests + step_reset_opa exactly (see that
 script's module docstring for the full rationale) — duplicated here as a standalone,
@@ -15,7 +37,8 @@ PowerShell-callable CLI rather than shared via import, matching this repo's exis
 of small, independent scripts.
 
 Usage:
-  python3 reset_hitl_policy.py --mesh-base-url https://... --mesh-mongo-uri mongodb://...
+  python3 reset_hitl_policy.py --mesh-base-url https://...                         # policy only
+  python3 reset_hitl_policy.py --mesh-base-url https://... --mesh-mongo-uri mongodb://...  # both
 """
 
 import argparse
@@ -131,7 +154,13 @@ def scrub_hitl_policy(mesh_base_url: str, tenant_id: str, workflow_ids: list, me
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mesh-base-url", required=True)
-    parser.add_argument("--mesh-mongo-uri", required=True, help="Connection string for the shared Mongo instance Mesh's operational store uses.")
+    parser.add_argument(
+        "--mesh-mongo-uri",
+        default=None,
+        help="Connection string for the shared Mongo instance Mesh's operational store uses. "
+             "Omit for a policy-only reset (no manifest cleanup, no Mongo access needed) — see "
+             "module docstring for what that does and doesn't clean up.",
+    )
     parser.add_argument("--tenant-id", default="default")
     parser.add_argument(
         "--mesh-admin-token",
@@ -142,7 +171,11 @@ def main():
     )
     args = parser.parse_args()
 
-    workflow_ids = clear_tagged_workflow_manifests(args.mesh_mongo_uri)
+    if args.mesh_mongo_uri:
+        workflow_ids = clear_tagged_workflow_manifests(args.mesh_mongo_uri)
+    else:
+        workflow_ids = []
+        print("No --mesh-mongo-uri given — policy-only reset (agent entries only, no manifest cleanup).")
     try:
         scrub_hitl_policy(args.mesh_base_url, args.tenant_id, workflow_ids, args.mesh_admin_token)
     except (urllib.error.URLError, RuntimeError) as e:
