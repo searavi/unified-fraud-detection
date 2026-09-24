@@ -218,10 +218,16 @@ try {
         $runtimeConfig = Get-Content (Join-Path $bundleDir "runtime-config.json") -Raw | ConvertFrom-Json
         # SERVICE_PORT must match Mesh's own ContainerRuntime:Port (9090) — see -AgentServicePort.
         $runtimeConfig | Add-Member -NotePropertyName SERVICE_PORT -NotePropertyValue $AgentServicePort -Force
-        # Required for the /invoke route's invocation-token exchange (mesh_invocation_auth.py) —
-        # without it, every real Mesh-dispatched invocation 401s as "misconfigured" the moment
-        # that Python-side auth port ships, since MESHAUTH__ENDPOINTURL defaults to empty.
-        $runtimeConfig | Add-Member -NotePropertyName MESHAUTH__ENDPOINTURL -NotePropertyValue $MeshBaseUrl -Force
+        # NOTE: mesh_invocation_auth.py's Mesh endpoint URL is NOT set here on purpose. Mesh's own
+        # ContainerDeploymentService.BuildEnvironmentVariables already auto-injects
+        # "MeshAuth__EndpointUrl" (its own real base URL) into every ContainerInstance agent
+        # unconditionally — confirmed live in the deployed task definition's env vars. Setting it
+        # again here previously caused a real bug: this dict's keys get merged into Mesh's own
+        # environment-variable dictionary case-INsensitively, so a same-named key here (even with
+        # different casing) silently overwrote Mesh's own entry's VALUE while keeping ITS casing on
+        # the wire — the config.py side then looked for a different casing and found nothing,
+        # 401ing every real Mesh-dispatched /invoke call with "misconfigured". config.py now reads
+        # this case-insensitively so it's robust to whichever casing Mesh actually uses.
         $runtimeConfig | Add-Member -NotePropertyName MONGODB_DATABASE -NotePropertyValue $MongoDatabaseName -Force
         $runtimeConfig | Add-Member -NotePropertyName LLM_PROVIDER -NotePropertyValue $LlmProvider -Force
         if ($LlmProvider -eq "gemini") {

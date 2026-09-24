@@ -91,6 +91,7 @@ function Get-SanitizedName {
 }
 
 $headers = @{ Authorization = "Bearer $MeshAdminToken" }
+$meshDeleteFailures = @()
 
 foreach ($agentId in $AgentIds) {
     Write-Host "`n=== Unregistering agent '$agentId' ===" -ForegroundColor Cyan
@@ -102,6 +103,14 @@ foreach ($agentId in $AgentIds) {
         if ($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -eq 404) {
             Write-Host "No Mesh registration exists for '$agentId' — skipping." -ForegroundColor Gray
         } else {
+            # NOT a soft failure: a stale/expired MeshAdminToken makes this 401 on every agent, and
+            # continuing to delete ECS services/secrets anyway leaves Mesh's own agent record
+            # (deploymentStatus, etc.) stale while the infra it points at is gone — a script running
+            # register right after this then either 409s (Mesh still thinks it exists) or, if it
+            # does succeed, has no way to distinguish this from a real fresh registration. Confirmed
+            # live: this exact sequence produced agents Mesh reported "Ready" with a container that
+            # no longer existed. Tracked below so the final summary is honest instead of unconditional.
+            $meshDeleteFailures += $agentId
             Write-Host "WARNING: failed to delete Mesh registration for '$agentId': $($_.Exception.Message) — continuing with infra cleanup anyway." -ForegroundColor Yellow
         }
     }
@@ -161,6 +170,16 @@ if ($DeleteEcrImages) {
             Write-Host "Repository '$AgentEcrRepoName' does not exist — skipping." -ForegroundColor Gray
         }
     }
+}
+
+if ($meshDeleteFailures.Count -gt 0) {
+    Write-Host "`n⚠️  ECS services/secrets removed for all agents, but Mesh's own registration record could NOT be deleted for: $($meshDeleteFailures -join ', ')." -ForegroundColor Yellow
+    Write-Host "   Likely an expired MeshAdminToken. Mesh now has a STALE record (deploymentStatus may say Ready) pointing at infra that no longer exists." -ForegroundColor Yellow
+    Write-Host "   Get a fresh token and DELETE these directly before re-registering, e.g.:" -ForegroundColor Yellow
+    foreach ($agentId in $meshDeleteFailures) {
+        Write-Host "     curl -X DELETE -H `"Authorization: Bearer `$TOKEN`" $MeshBaseUrl/api/v1/admin/agents/$agentId" -ForegroundColor Yellow
+    }
+    throw "Unregister incomplete — $($meshDeleteFailures.Count) of $($AgentIds.Count) agent(s) still have a stale Mesh registration record. See warnings above."
 }
 
 Write-Host "`n✅ All 4 fraud-detection agents unregistered and their ECS services/secrets removed." -ForegroundColor Green
