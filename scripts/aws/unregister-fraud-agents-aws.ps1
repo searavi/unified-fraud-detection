@@ -92,12 +92,26 @@ function Get-SanitizedName {
     if ($normalized.Length -eq 0) { return $normalized }
 
     $suffixHexLength = 12
-    $hashBytes = [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($Name))
+    $hashBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Name))
     $suffix = ([System.BitConverter]::ToString($hashBytes) -replace '-', '').Substring(0, $suffixHexLength).ToLowerInvariant()
 
     $maxBaseLength = 63 - 1 - $suffixHexLength
     $truncatedBase = $normalized.Substring(0, [Math]::Min($normalized.Length, $maxBaseLength)).TrimEnd('-')
     return "$truncatedBase-$suffix"
+}
+
+function Get-EcsServiceStatus {
+    # $null when the service doesn't exist (describe-services reports that under "failures" and
+    # still exits 0). Throws when the AWS call itself fails — e.g. expired credentials — so that
+    # is never mistaken for "service gone" or crashes on a null .services array.
+    param([string]$ServiceName)
+    $json = & aws ecs describe-services --region $Region --cluster $ClusterName --services $ServiceName 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "aws ecs describe-services failed for '$ServiceName' (exit code $LASTEXITCODE). Check AWS credentials (e.g. run 'aws login') and re-run."
+    }
+    $service = ($json | ConvertFrom-Json).services | Select-Object -First 1
+    if ($service) { return $service.status }
+    return $null
 }
 
 $headers = @{ Authorization = "Bearer $MeshAdminToken" }
@@ -128,8 +142,7 @@ foreach ($agentId in $AgentIds) {
     $sanitizedAgentId = Get-SanitizedName $agentId
     $serviceName = Get-SanitizedName "$DnsNameLabelPrefix-$sanitizedAgentId"
 
-    $existing = (& aws ecs describe-services --region $Region --cluster $ClusterName --services $serviceName 2>$null | ConvertFrom-Json).services | Where-Object { $_.status -eq "ACTIVE" }
-    if ($existing) {
+    if ((Get-EcsServiceStatus $serviceName) -eq "ACTIVE") {
         Write-Host "Scaling down and deleting ECS service '$serviceName'..." -ForegroundColor Gray
         aws ecs update-service --region $Region --cluster $ClusterName --service $serviceName --desired-count 0 2>&1 | Out-Null
         aws ecs delete-service --region $Region --cluster $ClusterName --service $serviceName --force 2>&1 | Out-Null
@@ -145,7 +158,7 @@ foreach ($agentId in $AgentIds) {
         Write-Host "Waiting for '$serviceName' to fully drain before returning..." -ForegroundColor Gray
         $drained = $false
         for ($i = 0; $i -lt 24; $i++) {
-            $status = (& aws ecs describe-services --region $Region --cluster $ClusterName --services $serviceName 2>$null | ConvertFrom-Json).services[0].status
+            $status = Get-EcsServiceStatus $serviceName
             if (-not $status -or $status -eq "INACTIVE") { $drained = $true; break }
             Start-Sleep -Seconds 10
         }
@@ -157,7 +170,11 @@ foreach ($agentId in $AgentIds) {
     }
 
     $secretPrefix = "synktron-agents/$Environment/$sanitizedAgentId/"
-    $secrets = (& aws secretsmanager list-secrets --region $Region --filters "Key=name,Values=$secretPrefix" 2>$null | ConvertFrom-Json).SecretList
+    $secretsJson = & aws secretsmanager list-secrets --region $Region --filters "Key=name,Values=$secretPrefix" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "aws secretsmanager list-secrets failed for '$secretPrefix' (exit code $LASTEXITCODE). Check AWS credentials (e.g. run 'aws login') and re-run."
+    }
+    $secrets = ($secretsJson | ConvertFrom-Json).SecretList
     foreach ($secret in $secrets) {
         aws secretsmanager delete-secret --region $Region --secret-id $secret.Name --force-delete-without-recovery 2>&1 | Out-Null
         Write-Host "Deleted secret '$($secret.Name)'." -ForegroundColor Gray
