@@ -16,8 +16,9 @@
     exact naming (confirmed from EcsFargateContainerOrchestrator.cs and its companion
     deploy-agent-container-to-ecs.ps1's Get-SanitizedName, which is documented to stay
     byte-for-byte identical to the C# side):
-      - ECS service name: SanitizeName("<DnsNameLabelPrefix>-<agentId>") = "synktron-agent-<id>"
-        (lowercased, non-[a-z0-9] runs collapsed to single hyphens).
+      - ECS service name: SanitizeName("<DnsNameLabelPrefix>-<SanitizeName(agentId)>"), e.g.
+        "synktron-agent-alert-validation-f5847bf3b68d-6878bd60721a" (lowercased, non-[a-z0-9] runs
+        collapsed to single hyphens, and each SanitizeName call appends a 12-hex SHA-256 suffix).
       - Secrets Manager prefix: "synktron-agents/<Environment>/<SanitizeName(agentId)>/" — NOT
         the service name; this one omits the DnsNameLabelPrefix.
       - Cluster/environment: confirmed live from Mesh's own ECS task definition env vars
@@ -84,10 +85,19 @@ function Get-SanitizedName {
     # Must stay byte-for-byte identical to EcsFargateContainerOrchestrator.SanitizeName (C# side)
     # and deploy-agent-container-to-ecs.ps1's own Get-SanitizedName — see this script's
     # .DESCRIPTION for why.
+    # Includes the deterministic -{12 hex chars of SHA-256(raw Name)} suffix, with the readable base
+    # truncated so the whole name fits in 63 characters.
     param([string]$Name)
     $normalized = ($Name.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
     if ($normalized.Length -eq 0) { return $normalized }
-    return $normalized.Substring(0, [Math]::Min($normalized.Length, 63)).TrimEnd('-')
+
+    $suffixHexLength = 12
+    $hashBytes = [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($Name))
+    $suffix = ([System.BitConverter]::ToString($hashBytes) -replace '-', '').Substring(0, $suffixHexLength).ToLowerInvariant()
+
+    $maxBaseLength = 63 - 1 - $suffixHexLength
+    $truncatedBase = $normalized.Substring(0, [Math]::Min($normalized.Length, $maxBaseLength)).TrimEnd('-')
+    return "$truncatedBase-$suffix"
 }
 
 $headers = @{ Authorization = "Bearer $MeshAdminToken" }
