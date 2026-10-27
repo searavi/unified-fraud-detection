@@ -533,7 +533,9 @@ def main():
         print(f"WARNING: {len(missed)} designated fraud users did not clear the risk threshold: {missed}")
         print("Consider raising typology intensity in generate_fraud_activity() or lowering --risk-threshold.")
 
-    print(f"Writing to MongoDB ({args.db_name} @ {args.mongo_uri})...")
+    # Host only: the URI's userinfo carries the password and this output lands in CloudWatch.
+    mongo_host = args.mongo_uri.split("://", 1)[-1].split("/", 1)[0].split("?", 1)[0].rpartition("@")[2]
+    print(f"Writing to MongoDB ({args.db_name} @ {mongo_host})...")
     seeder.write_to_mongo(
         args.mongo_uri, args.db_name, account_facts, device_facts, flagged_accounts, args.clear
     )
